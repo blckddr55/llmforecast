@@ -28,6 +28,15 @@ runs, and the results are combined with a **logit-space mean** — averaging in
 log-odds space, which is symmetric around 0.5 and treats evidence additively
 rather than averaging raw probabilities.
 
+### Prior injection (optional)
+
+You can seed the agent with an external **prior anchor** — a market-implied
+probability for market questions, or a historical base rate for dataset
+questions. Pass `prior=<float in [0, 1]>` to `aggregate_forecasts` (or
+`run_agent`) and the agent starts from that anchor and updates away from it only
+as far as the evidence justifies. Omit it (the default) and the agent forms its
+own base rate.
+
 ## Requirements
 
 - Python ≥ 3.12
@@ -54,16 +63,27 @@ cp .env.example .env
 ## Usage
 
 ```bash
+# Default example question, no prior:
 uv run forecaster.py
+
+# Inject a prior anchor (a market price or historical base rate):
+uv run forecaster.py --prior 0.10
+
+# Your own question, with a prior and a custom number of trials:
+uv run forecaster.py "Will X happen before 2027?" --prior 0.62 --trials 3
 ```
 
-This forecasts the example question in `main()`. To forecast your own, edit that
-function or import the API directly:
+The question is an optional positional argument; `--prior` and `--trials` are
+optional flags. You can also call the API directly from Python:
 
 ```python
 from forecaster import aggregate_forecasts
 
+# Let the agent form its own base rate:
 p = aggregate_forecasts("Will event X happen before date Y?")
+
+# Or anchor it on an external prior (e.g. a prediction-market price of 62%):
+p = aggregate_forecasts("Will event X happen before date Y?", prior=0.62)
 print(p)
 ```
 
@@ -83,10 +103,10 @@ The knobs live at the top of `forecaster.py`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `MODEL` | `gemini-2.5-flash` | Gemini model |
+| `MODEL` | `gemini-3.5-flash` | Gemini model |
 | `MAX_STEPS` | `10` | Max agent steps per run |
 | `NUM_TRIALS` | `5` | Independent runs aggregated per question |
-| `MAX_OUTPUT_TOKENS` | `4096` | Output token cap per call |
+| `MAX_OUTPUT_TOKENS` | `8192` | Output token cap per call (headroom for thinking) |
 | `TEMPERATURE` | `1.0` | Sampling temperature (so trials diverge) |
-| `THINKING_BUDGET` | `0` | Gemini thinking budget; `0` disables it (use `-1` or a positive value for `*-pro` models) |
+| `THINKING_LEVEL` | `"high"` | Gemini 3 thinking depth — `"low"` or `"high"` |
 | `TAVILY_MAX_RESULTS` | `5` | Results per search |

@@ -19,6 +19,7 @@ Run with:  uv run forecaster.py
 Verbose:   LOG_LEVEL=DEBUG uv run forecaster.py   (adds the full evidence lists)
 """
 
+import argparse
 import logging
 import os
 import time
@@ -39,19 +40,19 @@ load_dotenv(ENV_PATH)
 
 # --- Configuration -----------------------------------------------------------
 
-MODEL = "gemini-2.5-flash"  # matches polyscrape's workhorse model
+MODEL = "gemini-3.5-flash"  # latest GA Gemini generation (newer than any 3.x Pro preview)
 
 MAX_STEPS = 10  # max agent steps per run before forcing a submission
 NUM_TRIALS = 5  # independent runs aggregated per question
-MAX_OUTPUT_TOKENS = 4096  # generous ceiling for a single structured function call
+MAX_OUTPUT_TOKENS = 8192  # headroom for high-effort thinking + the structured function call
 TEMPERATURE = 1.0  # >0 so the NUM_TRIALS runs genuinely diverge
 TAVILY_MAX_RESULTS = 5
 
-# Disable Gemini "thinking" so each forced function call is cheap and fits the
-# token budget, mirroring the no-thinking design of the original. 0 works on
-# gemini-2.5-flash / flash-lite; use -1 (dynamic) or a positive budget if you
-# switch MODEL to a *-pro model, which cannot fully disable thinking.
-THINKING_BUDGET = 0
+# Gemini 3 "thinking level" applied to each forced function call. "high"
+# maximizes reasoning depth; use "low" for cheaper, faster runs. On
+# gemini-3.5-flash this stays modest (a few hundred thinking tokens); give
+# MAX_OUTPUT_TOKENS more headroom if you switch to a heavier model.
+THINKING_LEVEL = "high"
 
 TOOL_NAME = "update_belief_and_act"
 
@@ -148,11 +149,29 @@ SYSTEM_PROMPT = (
     f"{MAX_STEPS} steps."
 )
 
-INITIAL_USER_TEMPLATE = (
-    "Forecasting question: {question}\n\n"
-    "Establish a reasonable base rate, then decide whether to search for evidence "
-    "or submit. Call the update_belief_and_act function now."
-)
+def build_initial_message(question: str, prior: float | None = None) -> str:
+    """Build the opening user message, optionally seeded with a prior anchor.
+
+    `prior` is an external probability anchor in [0, 1] — e.g. a market-implied
+    price for a market question, or a historical base rate for a dataset
+    question. When omitted, the agent forms its own base rate.
+    """
+    if prior is not None:
+        anchor = (
+            f"You are given an external prior anchor of {prior:.0%} for this "
+            "question (for example, the market-implied probability for a market "
+            "question, or the historical base rate for a dataset question). Begin "
+            "from this anchor and update away from it only as far as the evidence "
+            "justifies."
+        )
+    else:
+        anchor = "Establish a reasonable base rate before gathering evidence."
+    return (
+        f"Forecasting question: {question}\n\n"
+        f"{anchor}\n\n"
+        "Decide whether to search for evidence or submit. Call the "
+        "update_belief_and_act function now."
+    )
 
 # --- Clients (lazily constructed so the module is import-safe) ---------------
 
@@ -242,7 +261,9 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def run_agent(question: str, max_steps: int = MAX_STEPS) -> float:
+def run_agent(
+    question: str, prior: float | None = None, max_steps: int = MAX_STEPS
+) -> float:
     """Run a single forecasting agent loop and return its final probability.
 
     The model is forced to call `update_belief_and_act` at every step (function
@@ -250,13 +271,19 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> float:
     result as a function_response, and continue. On 'submit' (or when the step
     budget is exhausted) we return the last recorded probability, clamped to
     [0.05, 0.95].
+
+    If `prior` (a probability in [0, 1]) is given, the agent starts anchored on
+    it instead of forming its own base rate (prior injection).
     """
+    if prior is not None and not 0.0 <= prior <= 1.0:
+        raise ValueError(f"prior must be a probability in [0, 1], got {prior!r}")
+
     client = get_genai_client()
     config = types.GenerateContentConfig(
         system_instruction=SYSTEM_PROMPT,
         temperature=TEMPERATURE,
         max_output_tokens=MAX_OUTPUT_TOKENS,
-        thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
+        thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
         tools=[UPDATE_BELIEF_TOOL],
         tool_config=types.ToolConfig(
             function_calling_config=types.FunctionCallingConfig(
@@ -269,7 +296,7 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> float:
     contents: list[types.Content] = [
         types.Content(
             role="user",
-            parts=[types.Part(text=INITIAL_USER_TEMPLATE.format(question=question))],
+            parts=[types.Part(text=build_initial_message(question, prior))],
         )
     ]
     probability = 0.5  # fallback prior if the loop exits unexpectedly
@@ -336,15 +363,22 @@ def run_agent(question: str, max_steps: int = MAX_STEPS) -> float:
 # --- Multi-trial aggregation -------------------------------------------------
 
 
-def aggregate_forecasts(question: str, num_trials: int = NUM_TRIALS) -> float:
+def aggregate_forecasts(
+    question: str, prior: float | None = None, num_trials: int = NUM_TRIALS
+) -> float:
     """Run the agent `num_trials` times and combine results via a logit-space mean.
 
     Averaging in log-odds (logit) space is more principled than averaging raw
     probabilities: it treats evidence additively and is symmetric around 0.5.
-    Returns the aggregated probability in [0.05, 0.95].
+    An optional `prior` anchor (a probability in [0, 1]) is forwarded to every
+    run. Returns the aggregated probability in [0.05, 0.95].
     """
     logger.info(
-        "Forecasting in %d trials | model=%s | question: %s", num_trials, MODEL, question
+        "Forecasting in %d trials | model=%s | prior=%s | question: %s",
+        num_trials,
+        MODEL,
+        f"{prior:.0%}" if prior is not None else "none",
+        question,
     )
     overall_start = time.perf_counter()
 
@@ -352,7 +386,7 @@ def aggregate_forecasts(question: str, num_trials: int = NUM_TRIALS) -> float:
     for trial in range(1, num_trials + 1):
         logger.info("=== Trial %d/%d ===", trial, num_trials)
         trial_start = time.perf_counter()
-        probability = run_agent(question)
+        probability = run_agent(question, prior=prior)
         probabilities.append(probability)
         logger.info(
             "Trial %d/%d result: p=%.3f (%.1fs)",
@@ -378,6 +412,29 @@ def aggregate_forecasts(question: str, num_trials: int = NUM_TRIALS) -> float:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Bayesian Linguistic Forecaster")
+    parser.add_argument(
+        "question",
+        nargs="?",
+        default="Will Volodymyr Zelenskyy win the Nobel Peace Price in 2026?",
+        help="Forecasting question (defaults to a built-in example).",
+    )
+    parser.add_argument(
+        "--prior",
+        type=float,
+        default=None,
+        help="Optional prior anchor in [0, 1] — a market price or historical base rate.",
+    )
+    parser.add_argument(
+        "--trials",
+        type=int,
+        default=NUM_TRIALS,
+        help=f"Independent runs to aggregate (default: {NUM_TRIALS}).",
+    )
+    args = parser.parse_args()
+    if args.prior is not None and not 0.0 <= args.prior <= 1.0:
+        parser.error("--prior must be a probability between 0 and 1")
+
     logging.basicConfig(
         level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(message)s",
@@ -393,14 +450,12 @@ def main() -> None:
             f"(expected in {ENV_PATH})"
         )
 
-    question = (
-        "Will Volodymyr Zelenskyy win the Nobel Peace Price in 2026?"
+    final_probability = aggregate_forecasts(
+        args.question, prior=args.prior, num_trials=args.trials
     )
 
-    final_probability = aggregate_forecasts(question, num_trials=NUM_TRIALS)
-
     print(
-        f"\nAggregated probability (logit-space mean of {NUM_TRIALS} trials): "
+        f"\nAggregated probability (logit-space mean of {args.trials} trials): "
         f"{final_probability:.3f}"
     )
 
