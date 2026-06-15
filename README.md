@@ -106,8 +106,27 @@ LOG_LEVEL=DEBUG uv run forecaster.py
 
 Every run is written to `runs/` as a timestamped JSON record — the question, any
 prior, the per-trial final beliefs (probability, evidence, reasoning), the
-aggregated probability, and the synthesized briefing — so decisions aren't lost
-when the process exits.
+aggregated probability, and the synthesized briefing — plus an `outcome` field you
+fill in when the question resolves — so decisions aren't lost when the process
+exits.
+
+## Calibration
+
+Forecasts can be calibrated across **sources** (the model that produced each run)
+with hierarchical Platt scaling (`calibration.py`):
+
+```bash
+# 1. Record the actual outcome on a resolved question:
+uv run forecaster.py --resolve runs/<file>.json --outcome 1
+
+# 2. Fit the calibrator across all resolved runs and report the improvement:
+uv run forecaster.py --calibrate
+```
+
+The fit learns a global slope/intercept plus a per-source (per-model) offset that
+is L2-regularized toward zero (`--lam`, default 1.0), and reports leave-one-out
+log loss and Brier before vs. after. `calibration.py` also runs standalone
+(`uv run calibration.py`) on synthetic data.
 
 ## Configuration
 

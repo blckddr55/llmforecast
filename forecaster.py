@@ -36,6 +36,8 @@ from google.genai import types
 from scipy.special import expit, logit
 from tavily import TavilyClient
 
+import calibration
+
 logger = logging.getLogger("forecaster")
 
 # Load API keys from this project's local .env file (git-ignored).
@@ -548,6 +550,7 @@ def save_run(
     payload = {
         "timestamp": now.isoformat(),
         "question": question,
+        "outcome": None,  # fill in via --resolve once the question resolves
         "prior": prior,
         "model": MODEL,
         "thinking_level": THINKING_LEVEL,
@@ -559,6 +562,86 @@ def save_run(
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+# --- Calibration across sources ----------------------------------------------
+
+
+def load_resolved_runs() -> list[dict]:
+    """Load saved runs that carry a recorded binary outcome (0 or 1)."""
+    runs = []
+    for path in sorted(RUNS_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if data.get("outcome") in (0, 1):
+            runs.append(data)
+    return runs
+
+
+def resolve_run(run_path: str | Path, outcome: int) -> Path:
+    """Record the actual binary outcome (0/1) on a saved run file."""
+    path = Path(run_path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["outcome"] = int(outcome)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def calibrate_across_sources(lam: float = 1.0) -> dict:
+    """Fit hierarchical Platt scaling across all resolved runs.
+
+    Each run's `model` is treated as a calibration "source", so the fit learns a
+    global slope/intercept plus a per-model offset (L2-regularized toward zero).
+    Returns a report with the fitted parameters, the leave-one-out calibrated
+    probabilities, and the underlying arrays for scoring.
+    """
+    runs = load_resolved_runs()
+    if len(runs) < 2:
+        raise SystemExit(
+            f"Need at least 2 resolved runs to calibrate; found {len(runs)}. "
+            "Resolve runs first: forecaster.py --resolve <runs/...json> --outcome 0|1"
+        )
+    models = sorted({r["model"] for r in runs})
+    source_of = {model: i for i, model in enumerate(models)}
+    p_hat = np.array([float(r["probability"]) for r in runs])
+    y = np.array([int(r["outcome"]) for r in runs])
+    source_idx = np.array([source_of[r["model"]] for r in runs])
+
+    calibrated = calibration.loocv_calibrate(p_hat, y, source_idx, lam=lam)
+    a, b, delta = calibration.fit(
+        calibration.safe_logit(p_hat), y, source_idx, len(models), lam
+    )
+    return {
+        "n": len(runs),
+        "models": models,
+        "p_hat": p_hat,
+        "y": y,
+        "calibrated": calibrated,
+        "a": float(a),
+        "b": float(b),
+        "delta": [float(d) for d in delta],
+    }
+
+
+def print_calibration_report(report: dict) -> None:
+    """Print the per-source offsets and leave-one-out calibration metrics."""
+    print(f"Resolved runs: {report['n']} | sources (models): {len(report['models'])}")
+    print(f"Global fit: slope a={report['a']:.3f}, intercept b={report['b']:.3f}")
+    print("Per-source offsets (delta_s):")
+    for model, d in zip(report["models"], report["delta"]):
+        print(f"  {model:<26} {d:+.3f}")
+    p_hat, y, cal = report["p_hat"], report["y"], report["calibrated"]
+    print("Leave-one-out quality (lower is better):")
+    print(
+        f"  log loss : raw {calibration.log_loss(p_hat, y):.4f}  ->  "
+        f"calibrated {calibration.log_loss(cal, y):.4f}"
+    )
+    print(
+        f"  Brier    : raw {calibration.brier(p_hat, y):.4f}  ->  "
+        f"calibrated {calibration.brier(cal, y):.4f}"
+    )
 
 
 # --- Example execution -------------------------------------------------------
@@ -584,15 +667,50 @@ def main() -> None:
         default=NUM_TRIALS,
         help=f"Independent runs to aggregate (default: {NUM_TRIALS}).",
     )
+    parser.add_argument(
+        "--resolve",
+        metavar="RUN_JSON",
+        help="Record an outcome on a saved run (pair with --outcome), then exit.",
+    )
+    parser.add_argument(
+        "--outcome",
+        type=int,
+        choices=(0, 1),
+        help="Actual binary outcome for --resolve.",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Fit hierarchical Platt scaling across resolved runs (per model), then exit.",
+    )
+    parser.add_argument(
+        "--lam",
+        type=float,
+        default=1.0,
+        help="L2 weight on per-source offsets for --calibrate (default: 1.0).",
+    )
     args = parser.parse_args()
-    if args.prior is not None and not 0.0 <= args.prior <= 1.0:
-        parser.error("--prior must be a probability between 0 and 1")
 
     logging.basicConfig(
         level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Offline modes (no API keys required).
+    if args.calibrate:
+        print_calibration_report(calibrate_across_sources(lam=args.lam))
+        return
+    if args.resolve is not None:
+        if args.outcome is None:
+            parser.error("--resolve requires --outcome 0 or 1")
+        path = resolve_run(args.resolve, args.outcome)
+        print(f"Recorded outcome={args.outcome} on {path}")
+        return
+
+    # Forecast mode.
+    if args.prior is not None and not 0.0 <= args.prior <= 1.0:
+        parser.error("--prior must be a probability between 0 and 1")
 
     missing = [
         key for key in ("GEMINI_API_KEY", "TAVILY_API_KEY") if not os.environ.get(key)

@@ -90,13 +90,13 @@ def loocv_calibrate(p_hat, y, source_idx, lam=1.0):
     return calibrated
 
 
-def _log_loss(p, y):
+def log_loss(p, y):
     p = np.clip(np.asarray(p, dtype=float), EPS, 1.0 - EPS)
     y = np.asarray(y, dtype=float)
     return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log1p(-p)))
 
 
-def _brier(p, y):
+def brier(p, y):
     return float(np.mean((np.asarray(p, dtype=float) - np.asarray(y, dtype=float)) ** 2))
 
 
@@ -126,12 +126,12 @@ def main() -> None:
 
     print("\nCalibration quality vs outcomes (lower is better):")
     print(
-        f"  log loss : raw {_log_loss(p_hat, y):.4f}  ->  "
-        f"calibrated {_log_loss(calibrated, y):.4f}"
+        f"  log loss : raw {log_loss(p_hat, y):.4f}  ->  "
+        f"calibrated {log_loss(calibrated, y):.4f}"
     )
     print(
-        f"  Brier    : raw {_brier(p_hat, y):.4f}  ->  "
-        f"calibrated {_brier(calibrated, y):.4f}"
+        f"  Brier    : raw {brier(p_hat, y):.4f}  ->  "
+        f"calibrated {brier(calibrated, y):.4f}"
     )
 
 
