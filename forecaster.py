@@ -310,8 +310,12 @@ def run_agent(
         raise ValueError(f"prior must be a probability in [0, 1], got {prior!r}")
 
     client = get_genai_client()
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=(
+            f"{SYSTEM_PROMPT}\n\n"
+            f"Today's date is {today}; do not search for the current date."
+        ),
         temperature=TEMPERATURE,
         max_output_tokens=MAX_OUTPUT_TOKENS,
         thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
