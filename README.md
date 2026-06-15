@@ -70,9 +70,8 @@ print(p)
 ### Logging
 
 Progress is logged via the standard `logging` module. The default `INFO` level
-shows each step's probability / action / reasoning, every search query and
-result summary, and per-trial timing. For full detail (evidence lists and
-per-source hits):
+shows each step's probability / action / reasoning, every search query with its
+result titles and links, and per-trial timing. For full detail (evidence lists):
 
 ```bash
 LOG_LEVEL=DEBUG uv run forecaster.py

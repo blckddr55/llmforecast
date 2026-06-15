@@ -16,7 +16,7 @@ API keys are loaded from a local .env file (git-ignored) and must include:
     TAVILY_API_KEY
 
 Run with:  uv run forecaster.py
-Verbose:   LOG_LEVEL=DEBUG uv run forecaster.py   (adds evidence lists + per-source hits)
+Verbose:   LOG_LEVEL=DEBUG uv run forecaster.py   (adds the full evidence lists)
 """
 
 import logging
@@ -41,10 +41,10 @@ load_dotenv(ENV_PATH)
 
 MODEL = "gemini-2.5-flash"  # matches polyscrape's workhorse model
 
-MAX_STEPS = 10            # max agent steps per run before forcing a submission
-NUM_TRIALS = 5            # independent runs aggregated per question
+MAX_STEPS = 10  # max agent steps per run before forcing a submission
+NUM_TRIALS = 5  # independent runs aggregated per question
 MAX_OUTPUT_TOKENS = 4096  # generous ceiling for a single structured function call
-TEMPERATURE = 1.0         # >0 so the NUM_TRIALS runs genuinely diverge
+TEMPERATURE = 1.0  # >0 so the NUM_TRIALS runs genuinely diverge
 TAVILY_MAX_RESULTS = 5
 
 # Disable Gemini "thinking" so each forced function call is cheap and fits the
@@ -223,7 +223,7 @@ def tavily_search(query: str, max_results: int = TAVILY_MAX_RESULTS) -> str:
             url = result.get("url", "")
             content = (result.get("content") or "").strip()
             parts.append(f"\n[{i}] {title}\n{url}\n{content}")
-            logger.debug("  [%d] %s — %s", i, title, url)
+            logger.info("  [%d] %s — %s", i, title, url)
 
     formatted = "\n".join(parts)
     logger.info(
@@ -394,8 +394,7 @@ def main() -> None:
         )
 
     question = (
-        "Will a privately funded crewed spacecraft land humans on the Moon "
-        "before 2030?"
+        "Will Volodymyr Zelenskyy win the Nobel Peace Price in 2026?"
     )
 
     final_probability = aggregate_forecasts(question, num_trials=NUM_TRIALS)
