@@ -26,7 +26,9 @@ a function response, and updates again — up to `MAX_STEPS` (10). When it
 To reduce variance, each question is forecast over `NUM_TRIALS` (5) independent
 runs, and the results are combined with a **logit-space mean** — averaging in
 log-odds space, which is symmetric around 0.5 and treats evidence additively
-rather than averaging raw probabilities.
+rather than averaging raw probabilities. A final model call then synthesizes the
+trials into a short briefing: the headline probability and spread, the strongest
+evidence for and against, and a bottom line.
 
 ### Prior injection (optional)
 
@@ -79,12 +81,12 @@ optional flags. You can also call the API directly from Python:
 ```python
 from forecaster import aggregate_forecasts
 
-# Let the agent form its own base rate:
-p = aggregate_forecasts("Will event X happen before date Y?")
+result = aggregate_forecasts("Will event X happen before date Y?")
+print(result.probability)   # aggregated probability (logit-space mean)
+print(result.summary)       # synthesized briefing of the argument
 
-# Or anchor it on an external prior (e.g. a prediction-market price of 62%):
-p = aggregate_forecasts("Will event X happen before date Y?", prior=0.62)
-print(p)
+# Anchor on an external prior (e.g. a prediction-market price of 62%):
+result = aggregate_forecasts("Will event X happen before date Y?", prior=0.62)
 ```
 
 ### Logging
@@ -96,6 +98,13 @@ result titles and links, and per-trial timing. For full detail (evidence lists):
 ```bash
 LOG_LEVEL=DEBUG uv run forecaster.py
 ```
+
+## Saved runs
+
+Every run is written to `runs/` as a timestamped JSON record — the question, any
+prior, the per-trial final beliefs (probability, evidence, reasoning), the
+aggregated probability, and the synthesized briefing — so decisions aren't lost
+when the process exits.
 
 ## Configuration
 

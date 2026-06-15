@@ -20,9 +20,13 @@ Verbose:   LOG_LEVEL=DEBUG uv run forecaster.py   (adds the full evidence lists)
 """
 
 import argparse
+import json
 import logging
 import os
+import re
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -37,6 +41,9 @@ logger = logging.getLogger("forecaster")
 # Load API keys from this project's local .env file (git-ignored).
 ENV_PATH = Path(__file__).resolve().parent / ".env"
 load_dotenv(ENV_PATH)
+
+# Saved forecast records (one JSON per run) so decisions aren't lost.
+RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
 # --- Configuration -----------------------------------------------------------
 
@@ -263,14 +270,15 @@ def _clamp(value: float, low: float, high: float) -> float:
 
 def run_agent(
     question: str, prior: float | None = None, max_steps: int = MAX_STEPS
-) -> float:
-    """Run a single forecasting agent loop and return its final probability.
+) -> dict:
+    """Run a single forecasting agent loop and return its final belief.
 
     The model is forced to call `update_belief_and_act` at every step (function
     calling mode 'ANY'). On a 'web_search' action we run Tavily, append the
     result as a function_response, and continue. On 'submit' (or when the step
-    budget is exhausted) we return the last recorded probability, clamped to
-    [0.05, 0.95].
+    budget is exhausted) we return the last belief — the tool-call arguments
+    (probability, evidence_for/against, reasoning, ...) with `probability`
+    clamped to [0.05, 0.95].
 
     If `prior` (a probability in [0, 1]) is given, the agent starts anchored on
     it instead of forming its own base rate (prior injection).
@@ -300,6 +308,15 @@ def run_agent(
         )
     ]
     probability = 0.5  # fallback prior if the loop exits unexpectedly
+    belief: dict = {
+        "probability": probability,
+        "confidence": "low",
+        "evidence_for": [],
+        "evidence_against": [],
+        "update_reasoning": "",
+        "action": "submit",
+        "action_input": "",
+    }
 
     for step in range(1, max_steps + 1):
         response = client.models.generate_content(
@@ -313,8 +330,9 @@ def run_agent(
             break
         call = calls[0]
 
-        belief = call.args or {}
+        belief = dict(call.args or {})
         probability = _clamp(float(belief.get("probability", probability)), 0.05, 0.95)
+        belief["probability"] = probability  # store the clamped value
         action = belief.get("action", "submit")
 
         logger.info(
@@ -357,21 +375,84 @@ def run_agent(
             )
         )
 
-    return probability
+    return belief
 
 
 # --- Multi-trial aggregation -------------------------------------------------
 
 
+@dataclass
+class ForecastResult:
+    """Aggregated forecast plus a model-written briefing of the argument."""
+
+    probability: float  # aggregated (logit-space mean), in [0.05, 0.95]
+    trials: list[dict]  # per-trial final beliefs (probability, evidence, reasoning)
+    summary: str  # synthesized "case for / case against / bottom line"
+
+    @property
+    def trial_probabilities(self) -> list[float]:
+        return [float(b["probability"]) for b in self.trials]
+
+
+def summarize_forecast(
+    question: str,
+    beliefs: list[dict],
+    aggregated: float,
+    prior: float | None = None,
+) -> str:
+    """Synthesize the trials into one short briefing via a final model call."""
+    trial_blocks = []
+    for i, belief in enumerate(beliefs, start=1):
+        rationale = belief.get("action_input") or belief.get("update_reasoning") or "n/a"
+        trial_blocks.append(
+            f"Trial {i} — probability {belief.get('probability', 0.0):.2f} "
+            f"(confidence: {belief.get('confidence', '?')})\n"
+            f"  For: {'; '.join(belief.get('evidence_for') or []) or 'none'}\n"
+            f"  Against: {'; '.join(belief.get('evidence_against') or []) or 'none'}\n"
+            f"  Rationale: {rationale}"
+        )
+    trials_text = "\n\n".join(trial_blocks)
+    spread = ", ".join(f"{b.get('probability', 0.0):.2f}" for b in beliefs)
+    prior_line = (
+        f"An external prior anchor of {prior:.0%} was supplied.\n\n"
+        if prior is not None
+        else ""
+    )
+    prompt = (
+        f"Forecasting question: {question}\n\n"
+        f"{prior_line}"
+        f"{len(beliefs)} independent forecasts were run; their probabilities were "
+        f"[{spread}], combined (logit-space mean) into {aggregated:.2f}.\n\n"
+        f"Per-trial evidence and reasoning:\n{trials_text}\n\n"
+        "Write a concise briefing for a decision-maker that synthesizes ACROSS the "
+        "trials (do not just list them), using exactly these sections:\n"
+        f"Forecast: the aggregate probability ({aggregated:.0%}) and the spread.\n"
+        "The case for: the strongest, best-corroborated evidence raising the probability.\n"
+        "The case against: the strongest evidence lowering it.\n"
+        "Bottom line: one or two sentences on the overall judgement and key uncertainty."
+    )
+    response = get_genai_client().models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.3,
+            max_output_tokens=2048,
+            thinking_config=types.ThinkingConfig(thinking_level="low"),
+        ),
+    )
+    return (response.text or "").strip()
+
+
 def aggregate_forecasts(
     question: str, prior: float | None = None, num_trials: int = NUM_TRIALS
-) -> float:
+) -> ForecastResult:
     """Run the agent `num_trials` times and combine results via a logit-space mean.
 
     Averaging in log-odds (logit) space is more principled than averaging raw
     probabilities: it treats evidence additively and is symmetric around 0.5.
     An optional `prior` anchor (a probability in [0, 1]) is forwarded to every
-    run. Returns the aggregated probability in [0.05, 0.95].
+    run. Returns a `ForecastResult` with the aggregated probability, the per-trial
+    spread, and a synthesized briefing of the overall argument.
     """
     logger.info(
         "Forecasting in %d trials | model=%s | prior=%s | question: %s",
@@ -382,22 +463,22 @@ def aggregate_forecasts(
     )
     overall_start = time.perf_counter()
 
-    probabilities = []
+    beliefs = []
     for trial in range(1, num_trials + 1):
         logger.info("=== Trial %d/%d ===", trial, num_trials)
         trial_start = time.perf_counter()
-        probability = run_agent(question, prior=prior)
-        probabilities.append(probability)
+        belief = run_agent(question, prior=prior)
+        beliefs.append(belief)
         logger.info(
             "Trial %d/%d result: p=%.3f (%.1fs)",
             trial,
             num_trials,
-            probability,
+            belief["probability"],
             time.perf_counter() - trial_start,
         )
 
-    probs = np.asarray(probabilities, dtype=float)
-    aggregated = float(expit(np.mean(logit(probs))))
+    probabilities = [float(b["probability"]) for b in beliefs]
+    aggregated = float(expit(np.mean(logit(np.asarray(probabilities)))))
 
     logger.info(
         "All trials %s | logit-space mean=%.3f | elapsed %.1fs",
@@ -405,7 +486,44 @@ def aggregate_forecasts(
         aggregated,
         time.perf_counter() - overall_start,
     )
-    return aggregated
+
+    logger.info("Synthesizing final briefing...")
+    summary = summarize_forecast(question, beliefs, aggregated, prior)
+    return ForecastResult(
+        probability=aggregated,
+        trials=beliefs,
+        summary=summary,
+    )
+
+
+# --- Persistence -------------------------------------------------------------
+
+
+def save_run(
+    question: str,
+    result: ForecastResult,
+    prior: float | None = None,
+    num_trials: int | None = None,
+) -> Path:
+    """Write a forecast run to RUNS_DIR as JSON so the decision is not lost."""
+    RUNS_DIR.mkdir(exist_ok=True)
+    now = datetime.now(timezone.utc)
+    slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60] or "forecast"
+    path = RUNS_DIR / f"{now.strftime('%Y%m%dT%H%M%SZ')}_{slug}.json"
+    payload = {
+        "timestamp": now.isoformat(),
+        "question": question,
+        "prior": prior,
+        "model": MODEL,
+        "thinking_level": THINKING_LEVEL,
+        "num_trials": num_trials if num_trials is not None else len(result.trials),
+        "probability": result.probability,
+        "trial_probabilities": result.trial_probabilities,
+        "summary": result.summary,
+        "trials": result.trials,
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path
 
 
 # --- Example execution -------------------------------------------------------
@@ -450,14 +568,20 @@ def main() -> None:
             f"(expected in {ENV_PATH})"
         )
 
-    final_probability = aggregate_forecasts(
+    result = aggregate_forecasts(
         args.question, prior=args.prior, num_trials=args.trials
     )
+    saved_path = save_run(args.question, result, prior=args.prior, num_trials=args.trials)
 
+    spread = ", ".join(f"{p:.2f}" for p in result.trial_probabilities)
+    print("\n" + "=" * 72)
+    print(result.summary)
+    print("=" * 72)
     print(
-        f"\nAggregated probability (logit-space mean of {args.trials} trials): "
-        f"{final_probability:.3f}"
+        f"Aggregated probability: {result.probability:.3f}   "
+        f"({args.trials} trials: {spread})"
     )
+    print(f"Saved to: {saved_path.relative_to(Path.cwd()) if saved_path.is_relative_to(Path.cwd()) else saved_path}")
 
 
 if __name__ == "__main__":
