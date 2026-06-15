@@ -155,6 +155,14 @@ UPDATE_BELIEF_FUNCTION = types.FunctionDeclaration(
 
 UPDATE_BELIEF_TOOL = types.Tool(function_declarations=[UPDATE_BELIEF_FUNCTION])
 
+NO_MARKETS_RULE = (
+    "Do NOT use prediction markets or betting odds as evidence — not Polymarket, "
+    "Kalshi, PredictIt, Metaculus, Manifold, or sportsbook odds, and not even when "
+    "a news article quotes them. Ignore any market-implied probability or odds that "
+    "appear in search results, and never cite them. Base the forecast solely on "
+    "primary evidence: events, official data, fundamentals, and expert analysis."
+)
+
 SYSTEM_PROMPT = (
     "You are a Bayesian Linguistic Forecaster. You estimate the probability that "
     "a given claim is true or a given event will happen, expressed as a calibrated "
@@ -164,10 +172,7 @@ SYSTEM_PROMPT = (
     "the `update_belief_and_act` function to record your current posterior "
     "probability, the evidence for and against, your confidence, and the reasoning "
     "behind your update.\n\n"
-    "Base your estimate on primary evidence — news reports, official data, expert "
-    "analysis, and underlying fundamentals. Do NOT use prediction markets or "
-    "betting odds (e.g. Polymarket, Kalshi, PredictIt, Metaculus, betting sites) "
-    "as evidence; they are derivative and reasoning from them is circular.\n\n"
+    f"{NO_MARKETS_RULE}\n\n"
     "- If you still need information, set action='web_search' and put a focused, "
     "specific query in action_input. You will receive search results and update "
     "again.\n"
@@ -457,6 +462,9 @@ def summarize_forecast(
         "The case for: the strongest, best-corroborated evidence raising the probability.\n"
         "The case against: the strongest evidence lowering it.\n"
         "Bottom line: one or two sentences on the overall judgement and key uncertainty."
+        "\n\nDo not mention, cite, or rely on prediction markets or betting odds "
+        "anywhere in the briefing, even if the per-trial notes above reference them. "
+        "Build the case for and against from substantive evidence only."
     )
     response = get_genai_client().models.generate_content(
         model=MODEL,
