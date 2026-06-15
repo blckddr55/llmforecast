@@ -22,6 +22,9 @@ At every step the model is *forced* to call a single function,
 When the action is `web_search`, the agent runs Tavily, feeds the results back as
 a function response, and updates again — up to `MAX_STEPS` (10). When it
 `submit`s (or the step budget runs out), the run returns its final probability.
+Prediction-market and betting sites are excluded from the search, and the model
+is told not to treat their odds as evidence — so the forecast rests on primary
+sources rather than echoing a market price.
 
 To reduce variance, each question is forecast over `NUM_TRIALS` (5) independent
 runs, and the results are combined with a **logit-space mean** — averaging in

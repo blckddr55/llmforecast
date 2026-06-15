@@ -55,6 +55,24 @@ MAX_OUTPUT_TOKENS = 8192  # headroom for high-effort thinking + the structured f
 TEMPERATURE = 1.0  # >0 so the NUM_TRIALS runs genuinely diverge
 TAVILY_MAX_RESULTS = 5
 
+# Prediction-market / betting platforms excluded from search — their odds are
+# derivative, and reasoning from them would be circular.
+EXCLUDE_DOMAINS = [
+    "polymarket.com",
+    "kalshi.com",
+    "predictit.org",
+    "metaculus.com",
+    "manifold.markets",
+    "futuur.com",
+    "insightprediction.com",
+    "electionbettingodds.com",
+    "predictionhunt.com",
+    "oddschecker.com",
+    "betfair.com",
+    "smarkets.com",
+    "pinnacle.com",
+]
+
 # Gemini 3 "thinking level" applied to each forced function call. "high"
 # maximizes reasoning depth; use "low" for cheaper, faster runs. On
 # gemini-3.5-flash this stays modest (a few hundred thinking tokens); give
@@ -146,6 +164,10 @@ SYSTEM_PROMPT = (
     "the `update_belief_and_act` function to record your current posterior "
     "probability, the evidence for and against, your confidence, and the reasoning "
     "behind your update.\n\n"
+    "Base your estimate on primary evidence — news reports, official data, expert "
+    "analysis, and underlying fundamentals. Do NOT use prediction markets or "
+    "betting odds (e.g. Polymarket, Kalshi, PredictIt, Metaculus, betting sites) "
+    "as evidence; they are derivative and reasoning from them is circular.\n\n"
     "- If you still need information, set action='web_search' and put a focused, "
     "specific query in action_input. You will receive search results and update "
     "again.\n"
@@ -228,6 +250,7 @@ def tavily_search(query: str, max_results: int = TAVILY_MAX_RESULTS) -> str:
             search_depth="advanced",
             max_results=max_results,
             include_answer=True,
+            exclude_domains=EXCLUDE_DOMAINS,
         )
     except Exception as exc:  # don't let a transient search failure kill the run
         logger.warning("search failed for %r: %s", query, exc)
