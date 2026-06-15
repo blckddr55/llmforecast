@@ -1,0 +1,13 @@
+[project]
+name = "llmforecast"
+version = "0.1.0"
+description = "Bayesian Linguistic Forecaster: a Claude + Tavily agent that estimates event probabilities via web-grounded Bayesian updates"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "google-genai>=2.8.0",
+    "numpy>=2.4.6",
+    "python-dotenv>=1.2.2",
+    "scipy>=1.17.1",
+    "tavily-python>=0.7.26",
+]
