@@ -25,6 +25,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -53,12 +55,19 @@ RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
 MODEL = "gemini-3.5-flash"  # latest GA Gemini generation (newer than any 3.x Pro preview)
 
-MAX_STEPS = 10  # max agent steps per run before forcing a submission
+MAX_STEPS = 14  # max agent steps per run before forcing a submission (read_files adds round-trips)
 NUM_TRIALS = 5  # independent runs aggregated per question
 MAX_OUTPUT_TOKENS = 8192  # headroom for high-effort thinking + the structured function call
 TEMPERATURE = 1.0  # >0 so the NUM_TRIALS runs genuinely diverge
-BRAVE_MAX_RESULTS = 5
+BRAVE_MAX_RESULTS = 10  # snippets shown per search (full text goes to files, not context)
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+
+# Progressive disclosure: search results are written to local files; the agent
+# reads chosen ones through a cheaper sub-LLM summarizer (Gemini Flash) so the
+# main context only ever sees short snippets plus the summaries it requested.
+SUMMARIZER_MODEL = MODEL  # the sub-LLM that summarizes read files
+SUMMARIZER_MAX_TOKENS = 1536  # output cap for a file summary
+SUMMARIZER_MAX_DOC_CHARS = 20000  # cap on concatenated file text sent to the summarizer
 
 # Prediction-market / betting platforms excluded from search — their odds are
 # derivative, and reasoning from them would be circular.
@@ -132,17 +141,31 @@ UPDATE_BELIEF_FUNCTION = types.FunctionDeclaration(
             ),
             "action": types.Schema(
                 type="STRING",
-                enum=["web_search", "submit"],
+                enum=["web_search", "read_files", "submit"],
                 description=(
-                    "Choose 'web_search' to gather more evidence, or 'submit' to "
-                    "finalize the current probability as your answer."
+                    "Choose 'web_search' to run a new search (you get back short "
+                    "snippets, each with a file id); 'read_files' to pull the full "
+                    "content of chosen results (by id) back as a focused summary; "
+                    "or 'submit' to finalize the current probability as your answer."
                 ),
             ),
             "action_input": types.Schema(
                 type="STRING",
                 description=(
-                    "If action is 'web_search', a focused search query. If action "
-                    "is 'submit', a brief justification of the final probability."
+                    "If action is 'web_search', a focused search query. If action is "
+                    "'read_files', the instruction for the summarizer — the specific "
+                    "facts to extract from the chosen files. If action is 'submit', a "
+                    "brief justification of the final probability."
+                ),
+            ),
+            "read_file_ids": types.Schema(
+                type="ARRAY",
+                items=types.Schema(type="STRING"),
+                description=(
+                    "Only for action='read_files': the file ids (e.g. "
+                    "'search_1_result_3') from earlier search snippets to read in "
+                    "full. Pick the few most promising; their content is summarized "
+                    "with your action_input and returned to you."
                 ),
             ),
         },
@@ -178,14 +201,20 @@ SYSTEM_PROMPT = (
     "probability, the evidence for and against, your confidence, and the reasoning "
     "behind your update.\n\n"
     f"{NO_MARKETS_RULE}\n\n"
-    "- If you still need information, set action='web_search' and put a focused, "
-    "specific query in action_input. You will receive search results and update "
-    "again.\n"
-    "- When further searching is unlikely to change your estimate, set "
+    "You gather evidence through a two-stage search:\n"
+    "- set action='web_search' with a focused query in action_input. You get back "
+    "a list of short snippets, each tagged with a file id (e.g. "
+    "'search_1_result_3'). Snippets are deliberately brief — scan them to spot the "
+    "most promising sources.\n"
+    "- set action='read_files' with the chosen ids in read_file_ids and, in "
+    "action_input, a specific instruction for what to extract. The full text of "
+    "those results is summarized for you and returned. Read before trusting a "
+    "snippet; do not submit on snippets alone when a result looks decisive.\n"
+    "- when further evidence is unlikely to change your estimate, set "
     "action='submit' and use action_input to briefly justify your final number.\n\n"
     "Calibrate carefully and avoid overconfidence: reserve probabilities near 0.05 "
     "or 0.95 for cases backed by strong, corroborated evidence. You have at most "
-    f"{MAX_STEPS} steps."
+    f"{MAX_STEPS} steps, so spend reads on the results that matter."
 )
 
 def build_initial_message(question: str, prior: float | None = None) -> str:
@@ -208,8 +237,9 @@ def build_initial_message(question: str, prior: float | None = None) -> str:
     return (
         f"Forecasting question: {question}\n\n"
         f"{anchor}\n\n"
-        "Decide whether to search for evidence or submit. Call the "
-        "update_belief_and_act function now."
+        "Decide whether to search for evidence (web_search), read promising "
+        "results in full (read_files), or submit. Call the update_belief_and_act "
+        "function now."
     )
 
 # --- Clients (lazily constructed so the module is import-safe) ---------------
@@ -254,25 +284,35 @@ def _is_excluded(url: str) -> bool:
     return any(host == d or host.endswith(f".{d}") for d in EXCLUDE_DOMAINS)
 
 
-def brave_search(query: str, max_results: int = BRAVE_MAX_RESULTS) -> str:
-    """Run a Brave web search and return content formatted for LLM context.
+def brave_search(
+    query: str, max_results: int = BRAVE_MAX_RESULTS
+) -> tuple[list[dict], str | None]:
+    """Run a Brave web search; return (results, error_message).
 
-    Brave's Web Search API returns ranked web results (title, URL, snippet) but
-    no synthesized answer, so we assemble the top source snippets into a compact,
-    readable string suitable for a function response. Prediction-market / betting
-    sites (EXCLUDE_DOMAINS) are filtered out of the results here, since the API
-    has no server-side domain-exclusion parameter; we over-fetch by that many
-    results so filtering still leaves up to `max_results`.
+    Each result dict has `title`, `url`, `short_snippet` (the one-line Brave
+    description shown to the agent in context) and `full_content` (description +
+    all extra excerpts, written to a file for on-demand reading). Requesting
+    `extra_snippets=true` yields up to 5 richer excerpts per result, subject to
+    the Brave plan tier. Prediction-market / betting sites (EXCLUDE_DOMAINS) are
+    filtered out client-side — the API has no server-side exclusion — so we
+    over-fetch to still leave up to `max_results`. On failure returns ([], msg).
     """
     api_key = get_brave_api_key()
     logger.info("search: %s", query)
     start = time.perf_counter()
     count = min(20, max_results + len(EXCLUDE_DOMAINS))
     params = urllib.parse.urlencode(
-        {"q": query, "count": count, "result_filter": "web"}
+        {
+            "q": query,
+            "count": count,
+            "result_filter": "web",
+            "extra_snippets": "true",
+        }
     )
+    request_url = f"{BRAVE_ENDPOINT}?{params}"
+    logger.debug("brave request: %s", request_url)
     request = urllib.request.Request(
-        f"{BRAVE_ENDPOINT}?{params}",
+        request_url,
         headers={"Accept": "application/json", "X-Subscription-Token": api_key},
     )
     try:
@@ -280,35 +320,105 @@ def brave_search(query: str, max_results: int = BRAVE_MAX_RESULTS) -> str:
             response = json.load(resp)
     except Exception as exc:  # don't let a transient search failure kill the run
         logger.warning("search failed for %r: %s", query, exc)
-        return f"Search failed for query {query!r}: {exc}"
+        return [], f"Search failed for query {query!r}: {exc}"
 
-    results = [
+    raw = [
         r
         for r in (response.get("web") or {}).get("results", [])
         if not _is_excluded(r.get("url", ""))
     ][:max_results]
 
-    parts = [f"Search query: {query}"]
-    if not results:
-        parts.append("\nNo results found.")
-    else:
-        parts.append("\nSources:")
-        for i, result in enumerate(results, start=1):
-            title = _strip_html(result.get("title", "")) or "(untitled)"
-            url = result.get("url", "")
-            extra = " ".join(_strip_html(s) for s in result.get("extra_snippets") or [])
-            content = f"{_strip_html(result.get('description', ''))} {extra}".strip()
-            parts.append(f"\n[{i}] {title}\n{url}\n{content}")
-            logger.info("  [%d] %s — %s", i, title, url)
+    results = []
+    for r in raw:
+        title = _strip_html(r.get("title", "")) or "(untitled)"
+        url = r.get("url", "")
+        description = _strip_html(r.get("description", ""))
+        extras = [_strip_html(s) for s in r.get("extra_snippets") or []]
+        if not extras:
+            logger.debug("no extra_snippets for %s (plan tier may not include them)", url)
+        body = "\n".join(filter(None, [description, *extras]))
+        results.append(
+            {
+                "title": title,
+                "url": url,
+                "short_snippet": description,
+                "full_content": f"{title}\n{url}\n\n{body}".strip(),
+            }
+        )
+        logger.info("  %s — %s", title, url)
 
-    formatted = "\n".join(parts)
     logger.info(
-        "search done: %d result(s), %d chars (%.1fs)",
-        len(results),
-        len(formatted),
-        time.perf_counter() - start,
+        "search done: %d result(s) (%.1fs)", len(results), time.perf_counter() - start
     )
-    return formatted
+    return results, None
+
+
+def register_search_results(
+    results: list[dict],
+    search_index: int,
+    scratch: Path,
+    registry: dict[str, Path],
+) -> str:
+    """Write each result's full content to a file, register its id, and return
+    the short snippet list (ids + title + url + one-line snippet) for context.
+
+    This is the progressive-disclosure split: only the short snippets enter the
+    agent's context; the full text lives in `<scratch>/<id>.md` until the agent
+    asks to read it.
+    """
+    if not results:
+        return "No results found."
+    lines = []
+    for j, result in enumerate(results, start=1):
+        file_id = f"search_{search_index}_result_{j}"
+        path = scratch / f"{file_id}.md"
+        path.write_text(result["full_content"], encoding="utf-8")
+        registry[file_id] = path
+        snippet = result["short_snippet"] or "(no snippet)"
+        lines.append(f"[{file_id}] {result['title']}\n{result['url']}\n{snippet}")
+    header = (
+        f"{len(results)} result(s). To read the full content of the most relevant "
+        "ones, call action='read_files' with their ids in read_file_ids and a "
+        "focused extraction instruction in action_input.\n"
+    )
+    return header + "\n\n".join(lines)
+
+
+def summarize(question: str, instruction: str, docs: list[str]) -> str:
+    """Summarize selected search-result files with the sub-LLM (Gemini Flash).
+
+    `instruction` is the main agent's extraction prompt (what facts to pull). The
+    original `question` and the no-markets rule are injected independently so the
+    summarizer stays on task and never surfaces market odds the main agent must
+    ignore. Returns an error string (never raises) so a failure can't kill a run.
+    """
+    if not docs:
+        return "No documents to summarize."
+    instruction = instruction.strip() or (
+        f"Extract any facts relevant to the forecasting question: {question}"
+    )
+    combined = "\n\n---\n\n".join(docs)[:SUMMARIZER_MAX_DOC_CHARS]
+    try:
+        response = get_genai_client().models.generate_content(
+            model=SUMMARIZER_MODEL,
+            contents=f"{instruction}\n\nDocuments:\n\n{combined}",
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are a research assistant extracting facts to help answer "
+                    f"this forecasting question: {question}\n\n{NO_MARKETS_RULE}\n\n"
+                    "Summarize only what the documents actually say that bears on the "
+                    "extraction request. Be concise and concrete; keep dates and "
+                    "figures. If the documents are irrelevant, say so plainly."
+                ),
+                temperature=0.3,
+                max_output_tokens=SUMMARIZER_MAX_TOKENS,
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+        return (response.text or "").strip() or "Summary was empty."
+    except Exception as exc:
+        logger.warning("summarization failed: %s", exc)
+        return f"Summarization failed: {exc}"
 
 
 # --- Agent loop --------------------------------------------------------------
@@ -318,17 +428,46 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def run_read_files(question: str, belief: dict, registry: dict[str, Path]) -> str:
+    """Resolve the agent's requested file ids, summarize them, return the result.
+
+    Unknown ids are skipped and reported so the model self-corrects; an empty or
+    all-unknown request returns the list of valid ids rather than failing.
+    """
+    requested = belief.get("read_file_ids") or []
+    docs, valid, unknown = [], [], []
+    for file_id in requested:
+        path = registry.get(file_id)
+        if path is None:
+            unknown.append(file_id)
+        else:
+            docs.append(path.read_text(encoding="utf-8"))
+            valid.append(file_id)
+
+    if not docs:
+        available = ", ".join(sorted(registry)) or "none yet — run a web_search first"
+        return f"No readable file ids in {requested or '[]'}. Available ids: {available}."
+
+    notes = f" (ignored unknown ids: {', '.join(unknown)})" if unknown else ""
+    summary = summarize(question, belief.get("action_input") or "", docs)
+    logger.info("  read_files: %s%s", ", ".join(valid), notes)
+    return f"Summary of {', '.join(valid)}{notes}:\n\n{summary}"
+
+
 def run_agent(
     question: str, prior: float | None = None, max_steps: int = MAX_STEPS
 ) -> dict:
     """Run a single forecasting agent loop and return its final belief.
 
     The model is forced to call `update_belief_and_act` at every step (function
-    calling mode 'ANY'). On a 'web_search' action we run Brave Search, append the
-    result as a function_response, and continue. On 'submit' (or when the step
-    budget is exhausted) we return the last belief — the tool-call arguments
-    (probability, evidence_for/against, reasoning, ...) with `probability`
-    clamped to [0.05, 0.95].
+    calling mode 'ANY'). On a 'web_search' action we run Brave Search, write each
+    result's full text to a per-run scratch file, and feed back only short
+    snippets (each tagged with a file id). On a 'read_files' action we summarize
+    the chosen files via the sub-LLM and feed back the summary (progressive
+    disclosure — the heavy text never floods the main context). On 'submit' (or
+    when the step budget is exhausted) we return the last belief — the tool-call
+    arguments (probability, evidence_for/against, reasoning, ...) with
+    `probability` clamped to [0.05, 0.95].
 
     If `prior` (a probability in [0, 1]) is given, the agent starts anchored on
     it instead of forming its own base rate (prior injection).
@@ -372,62 +511,79 @@ def run_agent(
         "action_input": "",
     }
 
-    for step in range(1, max_steps + 1):
-        response = client.models.generate_content(
-            model=MODEL, contents=contents, config=config
-        )
+    # Per-run scratch dir + id->path registry for the search files (progressive
+    # disclosure). Trials run sequentially, so this state is naturally isolated.
+    scratch = Path(tempfile.mkdtemp(prefix="forecast_"))
+    registry: dict[str, Path] = {}
+    search_index = 0
 
-        calls = response.function_calls or []
-        if not calls:
-            # Should not happen under forced function calling; bail with current estimate.
-            logger.warning("step %d: no function call returned; stopping early", step)
-            break
-        call = calls[0]
-
-        belief = dict(call.args or {})
-        probability = _clamp(float(belief.get("probability", probability)), 0.05, 0.95)
-        belief["probability"] = probability  # store the clamped value
-        action = belief.get("action", "submit")
-
-        logger.info(
-            "step %2d/%d | p=%.3f | confidence=%s | action=%s",
-            step,
-            max_steps,
-            probability,
-            belief.get("confidence", "?"),
-            action,
-        )
-        reasoning = belief.get("update_reasoning")
-        if reasoning:
-            logger.info("  reasoning: %s", reasoning)
-        logger.debug("  evidence_for: %s", belief.get("evidence_for", []))
-        logger.debug("  evidence_against: %s", belief.get("evidence_against", []))
-
-        # Preserve the model's function-call turn.
-        contents.append(response.candidates[0].content)
-
-        if action == "submit" or step == max_steps:
-            if action == "submit":
-                logger.info("  submit: %s", belief.get("action_input", ""))
-            else:
-                logger.info(
-                    "  step budget (%d) reached; submitting current estimate", max_steps
-                )
-            break
-
-        # action == "web_search": run the search and feed the result back.
-        query = belief.get("action_input") or question
-        result = brave_search(query)
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part.from_function_response(
-                        name=call.name, response={"result": result}
-                    )
-                ],
+    try:
+        for step in range(1, max_steps + 1):
+            response = client.models.generate_content(
+                model=MODEL, contents=contents, config=config
             )
-        )
+
+            calls = response.function_calls or []
+            if not calls:
+                # Should not happen under forced function calling; bail with current estimate.
+                logger.warning("step %d: no function call returned; stopping early", step)
+                break
+            call = calls[0]
+
+            belief = dict(call.args or {})
+            probability = _clamp(float(belief.get("probability", probability)), 0.05, 0.95)
+            belief["probability"] = probability  # store the clamped value
+            action = belief.get("action", "submit")
+
+            logger.info(
+                "step %2d/%d | p=%.3f | confidence=%s | action=%s",
+                step,
+                max_steps,
+                probability,
+                belief.get("confidence", "?"),
+                action,
+            )
+            reasoning = belief.get("update_reasoning")
+            if reasoning:
+                logger.info("  reasoning: %s", reasoning)
+            logger.debug("  evidence_for: %s", belief.get("evidence_for", []))
+            logger.debug("  evidence_against: %s", belief.get("evidence_against", []))
+
+            # Preserve the model's function-call turn.
+            contents.append(response.candidates[0].content)
+
+            if action == "submit" or step == max_steps:
+                if action == "submit":
+                    logger.info("  submit: %s", belief.get("action_input", ""))
+                else:
+                    logger.info(
+                        "  step budget (%d) reached; submitting current estimate", max_steps
+                    )
+                break
+
+            if action == "read_files":
+                result = run_read_files(question, belief, registry)
+            else:  # 'web_search' (and any unexpected action): run a new search
+                search_index += 1
+                results, error = brave_search(belief.get("action_input") or question)
+                result = error or register_search_results(
+                    results, search_index, scratch, registry
+                )
+
+            # The function_response must echo call.name (the only tool) so Gemini
+            # pairs it with the preceding call — true for both action branches.
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_function_response(
+                            name=call.name, response={"result": result}
+                        )
+                    ],
+                )
+            )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
     return belief
 
