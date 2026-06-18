@@ -1,8 +1,8 @@
-"""Bayesian Linguistic Forecaster (Google Gemini + Tavily).
+"""Bayesian Linguistic Forecaster (Google Gemini + Brave Search).
 
 An agent that estimates the probability of a forecasting question by reasoning
 like a superforecaster: it starts from a base rate and performs explicit Bayesian
-updates as it gathers web evidence via Tavily. At every step the model is forced
+updates as it gathers web evidence via Brave Search. At every step the model is forced
 to call a single function (`update_belief_and_act`) that records its current
 posterior probability, the supporting/contradicting evidence, and the next
 action (search again, or submit).
@@ -13,18 +13,21 @@ runs, and the resulting probabilities are combined with a logit-space mean
 
 API keys are loaded from a local .env file (git-ignored) and must include:
     GEMINI_API_KEY
-    TAVILY_API_KEY
+    BRAVE_API_KEY
 
 Run with:  uv run forecaster.py
 Verbose:   LOG_LEVEL=DEBUG uv run forecaster.py   (adds the full evidence lists)
 """
 
 import argparse
+import html
 import json
 import logging
 import os
 import re
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,7 +37,6 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from scipy.special import expit, logit
-from tavily import TavilyClient
 
 import calibration
 
@@ -55,7 +57,8 @@ MAX_STEPS = 10  # max agent steps per run before forcing a submission
 NUM_TRIALS = 5  # independent runs aggregated per question
 MAX_OUTPUT_TOKENS = 8192  # headroom for high-effort thinking + the structured function call
 TEMPERATURE = 1.0  # >0 so the NUM_TRIALS runs genuinely diverge
-TAVILY_MAX_RESULTS = 5
+BRAVE_MAX_RESULTS = 5
+BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
 # Prediction-market / betting platforms excluded from search — their odds are
 # derivative, and reasoning from them would be circular.
@@ -212,7 +215,7 @@ def build_initial_message(question: str, prior: float | None = None) -> str:
 # --- Clients (lazily constructed so the module is import-safe) ---------------
 
 _genai_client: genai.Client | None = None
-_tavily_client: TavilyClient | None = None
+_brave_api_key: str | None = None
 
 
 def get_genai_client() -> genai.Client:
@@ -226,58 +229,75 @@ def get_genai_client() -> genai.Client:
     return _genai_client
 
 
-def get_tavily_client() -> TavilyClient:
-    """Return a cached Tavily client (reads TAVILY_API_KEY from the env)."""
-    global _tavily_client
-    if _tavily_client is None:
-        api_key = os.environ.get("TAVILY_API_KEY")
+def get_brave_api_key() -> str:
+    """Return the cached Brave Search API key (reads BRAVE_API_KEY from the env)."""
+    global _brave_api_key
+    if _brave_api_key is None:
+        api_key = os.environ.get("BRAVE_API_KEY")
         if not api_key:
-            raise RuntimeError(f"TAVILY_API_KEY is not set (expected in {ENV_PATH}).")
-        _tavily_client = TavilyClient(api_key=api_key)
-    return _tavily_client
+            raise RuntimeError(f"BRAVE_API_KEY is not set (expected in {ENV_PATH}).")
+        _brave_api_key = api_key
+    return _brave_api_key
 
 
 # --- Search integration ------------------------------------------------------
 
 
-def tavily_search(query: str, max_results: int = TAVILY_MAX_RESULTS) -> str:
-    """Run a Tavily web search and return content formatted for LLM context.
+def _strip_html(text: str) -> str:
+    """Strip HTML tags and unescape entities from a Brave result snippet."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text or "")).strip()
 
-    Uses an "advanced" search with Tavily's synthesized answer plus the top
-    source snippets, assembled into a compact, readable string suitable for a
-    function response. (Tavily also offers `client.get_search_context(...)`,
-    which returns a token-budgeted context string directly, if you prefer that.)
+
+def _is_excluded(url: str) -> bool:
+    """True if the URL's host is (a subdomain of) an EXCLUDE_DOMAINS entry."""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(host == d or host.endswith(f".{d}") for d in EXCLUDE_DOMAINS)
+
+
+def brave_search(query: str, max_results: int = BRAVE_MAX_RESULTS) -> str:
+    """Run a Brave web search and return content formatted for LLM context.
+
+    Brave's Web Search API returns ranked web results (title, URL, snippet) but
+    no synthesized answer, so we assemble the top source snippets into a compact,
+    readable string suitable for a function response. Prediction-market / betting
+    sites (EXCLUDE_DOMAINS) are filtered out of the results here, since the API
+    has no server-side domain-exclusion parameter; we over-fetch by that many
+    results so filtering still leaves up to `max_results`.
     """
-    client = get_tavily_client()
+    api_key = get_brave_api_key()
     logger.info("search: %s", query)
     start = time.perf_counter()
+    count = min(20, max_results + len(EXCLUDE_DOMAINS))
+    params = urllib.parse.urlencode(
+        {"q": query, "count": count, "result_filter": "web"}
+    )
+    request = urllib.request.Request(
+        f"{BRAVE_ENDPOINT}?{params}",
+        headers={"Accept": "application/json", "X-Subscription-Token": api_key},
+    )
     try:
-        response = client.search(
-            query=query,
-            search_depth="advanced",
-            max_results=max_results,
-            include_answer=True,
-            exclude_domains=EXCLUDE_DOMAINS,
-        )
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            response = json.load(resp)
     except Exception as exc:  # don't let a transient search failure kill the run
         logger.warning("search failed for %r: %s", query, exc)
         return f"Search failed for query {query!r}: {exc}"
 
+    results = [
+        r
+        for r in (response.get("web") or {}).get("results", [])
+        if not _is_excluded(r.get("url", ""))
+    ][:max_results]
+
     parts = [f"Search query: {query}"]
-
-    answer = response.get("answer")
-    if answer:
-        parts.append(f"\nSummary answer:\n{answer}")
-
-    results = response.get("results", [])
     if not results:
         parts.append("\nNo results found.")
     else:
         parts.append("\nSources:")
         for i, result in enumerate(results, start=1):
-            title = result.get("title", "(untitled)")
+            title = _strip_html(result.get("title", "")) or "(untitled)"
             url = result.get("url", "")
-            content = (result.get("content") or "").strip()
+            extra = " ".join(_strip_html(s) for s in result.get("extra_snippets") or [])
+            content = f"{_strip_html(result.get('description', ''))} {extra}".strip()
             parts.append(f"\n[{i}] {title}\n{url}\n{content}")
             logger.info("  [%d] %s — %s", i, title, url)
 
@@ -304,7 +324,7 @@ def run_agent(
     """Run a single forecasting agent loop and return its final belief.
 
     The model is forced to call `update_belief_and_act` at every step (function
-    calling mode 'ANY'). On a 'web_search' action we run Tavily, append the
+    calling mode 'ANY'). On a 'web_search' action we run Brave Search, append the
     result as a function_response, and continue. On 'submit' (or when the step
     budget is exhausted) we return the last belief — the tool-call arguments
     (probability, evidence_for/against, reasoning, ...) with `probability`
@@ -397,7 +417,7 @@ def run_agent(
 
         # action == "web_search": run the search and feed the result back.
         query = belief.get("action_input") or question
-        result = tavily_search(query)
+        result = brave_search(query)
         contents.append(
             types.Content(
                 role="user",
@@ -713,7 +733,7 @@ def main() -> None:
         parser.error("--prior must be a probability between 0 and 1")
 
     missing = [
-        key for key in ("GEMINI_API_KEY", "TAVILY_API_KEY") if not os.environ.get(key)
+        key for key in ("GEMINI_API_KEY", "BRAVE_API_KEY") if not os.environ.get(key)
     ]
     if missing:
         raise SystemExit(

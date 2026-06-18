@@ -4,8 +4,8 @@ A web-grounded agent that estimates the probability of a forecasting question by
 reasoning like a superforecaster: it starts from a base rate and performs
 explicit Bayesian updates as it gathers evidence from the web.
 
-It uses **Google Gemini** (function calling) for reasoning and **Tavily** for
-web search.
+It uses **Google Gemini** (function calling) for reasoning and the **Brave Search
+API** for web search.
 
 ## How it works
 
@@ -19,8 +19,8 @@ At every step the model is *forced* to call a single function,
 - `action` — `web_search` or `submit`
 - `action_input` — a search query, or a final justification
 
-When the action is `web_search`, the agent runs Tavily, feeds the results back as
-a function response, and updates again — up to `MAX_STEPS` (10). When it
+When the action is `web_search`, the agent runs a Brave search, feeds the results
+back as a function response, and updates again — up to `MAX_STEPS` (10). When it
 `submit`s (or the step budget runs out), the run returns its final probability.
 Prediction-market and betting sites are excluded from the search, and the model
 is told not to treat their odds as evidence — so the forecast rests on primary
@@ -46,7 +46,7 @@ own base rate.
 
 - Python ≥ 3.12
 - [uv](https://docs.astral.sh/uv/)
-- A Google Gemini API key and a Tavily API key
+- A Google Gemini API key and a Brave Search API key
 
 ## Setup
 
@@ -62,7 +62,7 @@ Create a `.env` from the template and add your keys (`.env` is git-ignored):
 cp .env.example .env
 # then edit .env:
 #   GEMINI_API_KEY=...
-#   TAVILY_API_KEY=...
+#   BRAVE_API_KEY=...
 ```
 
 ## Usage
@@ -140,4 +140,4 @@ The knobs live at the top of `forecaster.py`:
 | `MAX_OUTPUT_TOKENS` | `8192` | Output token cap per call (headroom for thinking) |
 | `TEMPERATURE` | `1.0` | Sampling temperature (so trials diverge) |
 | `THINKING_LEVEL` | `"high"` | Gemini 3 thinking depth — `"low"` or `"high"` |
-| `TAVILY_MAX_RESULTS` | `5` | Results per search |
+| `BRAVE_MAX_RESULTS` | `5` | Results per search |
