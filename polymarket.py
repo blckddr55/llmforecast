@@ -53,6 +53,30 @@ def _parse_prices(market: dict) -> list[tuple[str, float]]:
     return [(name, _to_float(price)) for name, price in zip(outcomes, prices)]
 
 
+def fetch_events_raw(params: dict, max_results: int | None = None) -> list[dict]:
+    """Page through the Gamma `/events` endpoint and return the raw event dicts.
+
+    `params` are the query filters (active, closed, tag_slug, liquidity_min,
+    end_date_min/max, slug, order, ...); pagination (limit/offset) is handled
+    here. Returns the unmodified Gamma event objects — full market fields and all.
+    """
+    base = {**params, "limit": _PAGE_LIMIT}
+    raw: list[dict] = []
+    offset = 0
+    while True:
+        url = f"{GAMMA_EVENTS_URL}?{urllib.parse.urlencode({**base, 'offset': offset})}"
+        request = urllib.request.Request(url, headers=_HEADERS)
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            page = json.load(resp)
+        if not page:
+            break
+        raw.extend(page)
+        if len(page) < _PAGE_LIMIT or (max_results and len(raw) >= max_results):
+            break
+        offset += _PAGE_LIMIT
+    return raw[:max_results] if max_results else raw
+
+
 def fetch_markets(
     min_liquidity: float,
     within_days: int,
@@ -72,7 +96,7 @@ def fetch_markets(
     {question, prices: [(outcome, prob), ...]}.
     """
     now = datetime.now(timezone.utc)
-    base = {
+    filters = {
         "active": "true",
         "closed": "false",
         "liquidity_min": min_liquidity,
@@ -80,27 +104,9 @@ def fetch_markets(
         "end_date_max": _iso(now + timedelta(days=within_days)),
         "order": "liquidity",
         "ascending": "false",
-        "limit": _PAGE_LIMIT,
     }
     if tag_slug:
-        base["tag_slug"] = tag_slug
-
-    raw: list[dict] = []
-    offset = 0
-    while True:
-        url = f"{GAMMA_EVENTS_URL}?{urllib.parse.urlencode({**base, 'offset': offset})}"
-        request = urllib.request.Request(url, headers=_HEADERS)
-        with urllib.request.urlopen(request, timeout=30) as resp:
-            page = json.load(resp)
-        if not page:
-            break
-        raw.extend(page)
-        if len(page) < _PAGE_LIMIT or (max_results and len(raw) >= max_results):
-            break
-        offset += _PAGE_LIMIT
-
-    if max_results:
-        raw = raw[:max_results]
+        filters["tag_slug"] = tag_slug
 
     events = [
         {
@@ -116,7 +122,7 @@ def fetch_markets(
                 for m in (e.get("markets") or [])
             ],
         }
-        for e in raw
+        for e in fetch_events_raw(filters, max_results)
     ]
     logger.info(
         "fetched %d event(s) | liquidity >= $%s | ending within %d day(s)%s",

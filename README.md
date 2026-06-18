@@ -168,6 +168,33 @@ fits — calibration is never applied on top of itself) and a `calibrated_probab
 A category unseen at fit time falls back to the global fit (offset 0).
 `calibration.py` also runs standalone (`uv run calibration.py`) on synthetic data.
 
+### Fast calibration data: World Cup matches
+
+Calibration needs *resolved* forecasts, and most questions take months to settle.
+Match-winner markets resolve in hours, so `train_worldcup.py` uses them to build a
+calibration set quickly — it forecasts each upcoming match's binary "Will {team}
+win?" markets **independently** (no market prior; markets are ignored as evidence)
+and can auto-resolve them from Polymarket once the matches finish.
+
+```bash
+# Preview which match markets would be forecast (no LLM calls):
+uv run train_worldcup.py --days 3 --dry-run
+
+# Forecast the next few matches (each saved as a run tagged --category world-cup):
+uv run train_worldcup.py --days 3 --limit 4 --trials 3
+
+# After the matches play out, record outcomes automatically from Gamma:
+uv run train_worldcup.py --resolve
+
+# Then fit (needs enough resolved runs):
+uv run forecaster.py --calibrate
+```
+
+Each run stores a `market` reference (event slug + condition id) and the
+`market_price` (recorded only for comparison — it is **not** used as a prior), so
+`--resolve` can map it back to the settled outcome. Cost scales as matches ×
+2 markets × `--trials`, so start with `--dry-run` and a small `--limit`.
+
 ## Configuration
 
 The knobs live at the top of `forecaster.py`:

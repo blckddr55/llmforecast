@@ -829,8 +829,13 @@ def save_run(
     num_trials: int | None = None,
     background: str | None = None,
     resolution_criteria: str | None = None,
+    extra: dict | None = None,
 ) -> Path:
-    """Write a forecast run to RUNS_DIR as JSON so the decision is not lost."""
+    """Write a forecast run to RUNS_DIR as JSON so the decision is not lost.
+
+    `extra` is merged into the payload — used e.g. to attach a `market` reference
+    (platform, slug, condition_id) so the outcome can be resolved automatically.
+    """
     RUNS_DIR.mkdir(exist_ok=True)
     now = datetime.now(timezone.utc)
     slug = re.sub(r"[^a-z0-9]+", "-", question.lower()).strip("-")[:60] or "forecast"
@@ -851,6 +856,7 @@ def save_run(
         "trial_probabilities": result.trial_probabilities,
         "summary": result.summary,
         "trials": result.trials,
+        **(extra or {}),
     }
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
