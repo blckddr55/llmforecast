@@ -57,15 +57,19 @@ def fetch_markets(
     min_liquidity: float,
     within_days: int,
     max_results: int | None = None,
+    tag_slug: str | None = None,
 ) -> list[dict]:
     """Fetch open events with liquidity >= `min_liquidity` ending within `within_days`.
 
     Hits the public Gamma `/events` endpoint, filtering server-side by liquidity
     and an end-date window [now, now + within_days] and ordering by liquidity
-    (descending), paginating until exhausted (or `max_results` is reached).
+    (descending), paginating until exhausted (or `max_results` is reached). If
+    `tag_slug` is given (e.g. "politics", "sports", "crypto"), only events
+    carrying that tag are returned (also filtered server-side).
 
-    Returns one dict per event: `id`, `slug`, `title`, `endDate`, `liquidity`,
-    `volume`, and `markets` — a list of {question, prices: [(outcome, prob), ...]}.
+    Returns one dict per event: `id`, `slug`, `title`, `tags` (label list),
+    `endDate`, `liquidity`, `volume`, and `markets` — a list of
+    {question, prices: [(outcome, prob), ...]}.
     """
     now = datetime.now(timezone.utc)
     base = {
@@ -78,6 +82,8 @@ def fetch_markets(
         "ascending": "false",
         "limit": _PAGE_LIMIT,
     }
+    if tag_slug:
+        base["tag_slug"] = tag_slug
 
     raw: list[dict] = []
     offset = 0
@@ -101,6 +107,7 @@ def fetch_markets(
             "id": e.get("id"),
             "slug": e.get("slug"),
             "title": e.get("title"),
+            "tags": [t.get("label") for t in (e.get("tags") or []) if t.get("label")],
             "endDate": e.get("endDate"),
             "liquidity": _to_float(e.get("liquidity")),
             "volume": _to_float(e.get("volume")),
@@ -112,10 +119,11 @@ def fetch_markets(
         for e in raw
     ]
     logger.info(
-        "fetched %d event(s) | liquidity >= $%s | ending within %d day(s)",
+        "fetched %d event(s) | liquidity >= $%s | ending within %d day(s)%s",
         len(events),
         f"{min_liquidity:,.0f}",
         within_days,
+        f" | tag={tag_slug}" if tag_slug else "",
     )
     return events
 
@@ -127,6 +135,8 @@ def _format_event(event: dict, max_markets: int = 6) -> str:
         f"  ends {event['endDate']} | liquidity ${event['liquidity']:,.0f} "
         f"| volume ${event['volume']:,.0f}",
     ]
+    if event["tags"]:
+        lines.append(f"  tags: {', '.join(event['tags'])}")
     markets = event["markets"]
     for m in markets[:max_markets]:
         priced = ", ".join(f"{name} {prob:.0%}" for name, prob in m["prices"])
@@ -153,13 +163,20 @@ def main() -> None:
         help="cap the number of events returned (default: no cap)",
     )
     parser.add_argument(
+        "--tag", default=None, metavar="SLUG",
+        help="only events carrying this tag slug, e.g. politics, sports, crypto "
+        "(filtered server-side)",
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="emit raw JSON instead of the readable listing",
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    events = fetch_markets(args.min_liquidity, args.days, max_results=args.limit)
+    events = fetch_markets(
+        args.min_liquidity, args.days, max_results=args.limit, tag_slug=args.tag
+    )
     if args.json:
         print(json.dumps(events, indent=2))
         return

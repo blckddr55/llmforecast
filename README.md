@@ -101,15 +101,19 @@ result = aggregate_forecasts("Will event X happen before date Y?", prior=0.62)
 # Events with >= $50k liquidity resolving within 7 days, most liquid first:
 uv run polymarket.py --min-liquidity 50000 --days 7
 
-# Cap the count and emit raw JSON instead of the readable listing:
-uv run polymarket.py --min-liquidity 50000 --days 7 --limit 20 --json
+# Restrict to a tag (filtered server-side), cap the count, emit raw JSON:
+uv run polymarket.py --min-liquidity 50000 --days 30 --tag politics --limit 20 --json
 ```
+
+Polymarket has no single `category` field; events are labelled with multiple
+**tags** (e.g. `Politics`, `Sports`, `Crypto`). `--tag <slug>` filters by one
+server-side; the readable listing and the `tags` field show each event's labels.
 
 ```python
 from polymarket import fetch_markets
 
-events = fetch_markets(min_liquidity=50000, within_days=7)
-# each event: id, slug, title, endDate, liquidity, volume,
+events = fetch_markets(min_liquidity=50000, within_days=7, tag_slug="politics")
+# each event: id, slug, title, tags, endDate, liquidity, volume,
 # and markets[] = {question, prices: [(outcome, implied_probability), ...]}
 ```
 
