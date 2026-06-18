@@ -196,55 +196,83 @@ NO_MARKETS_RULE = (
 )
 
 SYSTEM_PROMPT = (
-    "You are a Bayesian Linguistic Forecaster. You estimate the probability that "
-    "a given claim is true or a given event will happen, expressed as a calibrated "
-    "number between 0.05 and 0.95.\n\n"
-    "Reason like a superforecaster: begin from a sensible base rate, then update "
-    "your belief incrementally as evidence arrives. At every step you MUST call "
-    "the `update_belief_and_act` function to record your current posterior "
-    "probability, the evidence for and against, your confidence, and the reasoning "
-    "behind your update.\n\n"
+    "You are an expert superforecaster. Your task is to predict the probability "
+    "that a binary question will resolve YES, based on the evidence you gather.\n\n"
+    "You work in a tool-use loop:\n"
+    "1. Read the question, its resolution criteria, and background.\n"
+    "2. Form a base rate estimate (outside view / reference-class reasoning).\n"
+    "3. Then loop: at each step call `update_belief_and_act` to record your "
+    "current belief state and choose ONE action. After each action your belief "
+    "state is updated with what you learned.\n"
+    "4. When you have gathered enough evidence, submit (action='submit') with your "
+    "final probability and reasoning.\n\n"
+    "Belief state rules:\n"
+    "- Evidence lists (evidence_for / evidence_against) must ACCUMULATE across "
+    "steps: carry forward what still holds and add to it — do not start fresh.\n"
+    "- Each evidence item MUST cite its source by file id (e.g. search_1_result_3).\n"
+    "- In update_reasoning, explain WHY the latest evidence changed your "
+    "probability (the Bayesian update you just performed).\n"
+    "- Weigh the RECENCY and AUTHORITATIVENESS of each source.\n\n"
     f"{NO_MARKETS_RULE}\n\n"
-    "You gather evidence through a two-stage search:\n"
-    "- set action='web_search' with a focused query in action_input. You get back "
-    "a list of short snippets, each tagged with a file id (e.g. "
-    "'search_1_result_3'). Snippets are deliberately brief — scan them to spot the "
-    "most promising sources.\n"
-    "- set action='read_files' with the chosen ids in read_file_ids and, in "
-    "action_input, a specific instruction for what to extract. The full text of "
-    "those results is summarized for you and returned. Read before trusting a "
-    "snippet; do not submit on snippets alone when a result looks decisive.\n"
-    "- when further evidence is unlikely to change your estimate, set "
-    "action='submit' and use action_input to briefly justify your final number.\n\n"
-    "Calibrate carefully and avoid overconfidence: reserve probabilities near 0.05 "
-    "or 0.95 for cases backed by strong, corroborated evidence. You have at most "
-    f"{MAX_STEPS} steps, so spend reads on the results that matter."
+    "Actions (set `action` on update_belief_and_act):\n"
+    "- 'web_search': run a focused query (in action_input). You get back short "
+    "snippets, each tagged with a file id (e.g. search_1_result_3) — scan them to "
+    "spot the most promising sources.\n"
+    "- 'read_files': read chosen results in full — put their ids in read_file_ids "
+    "and a specific extraction instruction in action_input. Their text is "
+    "summarized and returned. Read before trusting a snippet when a result looks "
+    "decisive.\n"
+    "- 'submit': finalize — put a brief justification of your probability in "
+    "action_input.\n\n"
+    "Rules:\n"
+    f"- You MUST submit before step {MAX_STEPS}.\n"
+    "- Submit once your probability has stabilized and further evidence is "
+    "unlikely to change it.\n"
+    "- Probabilities must be between 0.05 and 0.95; reserve the extremes for "
+    "claims backed by strong, corroborated evidence."
 )
 
-def build_initial_message(question: str, prior: float | None = None) -> str:
-    """Build the opening user message, optionally seeded with a prior anchor.
+def build_initial_message(
+    question: str,
+    prior: float | None = None,
+    background: str | None = None,
+    resolution_criteria: str | None = None,
+) -> str:
+    """Build the opening user message in the superforecaster question format.
 
-    `prior` is an external probability anchor in [0, 1] — e.g. a market-implied
-    price for a market question, or a historical base rate for a dataset
-    question. When omitted, the agent forms its own base rate.
+    `background` and `resolution_criteria` are optional context shown under a
+    dedicated heading (omitted when both are absent). `prior` is an optional
+    external anchor in [0, 1] — a market-implied price or a historical base rate;
+    when given the model starts from it and updates only as far as the evidence
+    justifies, otherwise it forms its own base rate by reference-class reasoning.
     """
+    parts = [f"# Question\n{question}"]
+
+    if background or resolution_criteria:
+        section = ["## Background and resolution criteria"]
+        if background:
+            section.append(background.strip())
+        if resolution_criteria:
+            section.append(resolution_criteria.strip())
+        parts.append("\n".join(section))
+
     if prior is not None:
-        anchor = (
-            f"You are given an external prior anchor of {prior:.0%} for this "
-            "question (for example, the market-implied probability for a market "
-            "question, or the historical base rate for a dataset question). Begin "
-            "from this anchor and update away from it only as far as the evidence "
-            "justifies."
+        parts.append(
+            "## Prior estimate\n"
+            f"An external prior estimate for this question is {prior:.0%} (a "
+            "market-implied probability or a historical base rate). Use this as "
+            "your starting point, but adjust based on question-specific evidence "
+            "from search and tools."
         )
     else:
-        anchor = "Establish a reasonable base rate before gathering evidence."
-    return (
-        f"Forecasting question: {question}\n\n"
-        f"{anchor}\n\n"
-        "Decide whether to search for evidence (web_search), read promising "
-        "results in full (read_files), or submit. Call the update_belief_and_act "
-        "function now."
-    )
+        parts.append(
+            "## Prior estimate\n"
+            "No prior is given. Establish your own base rate from reference-class "
+            "reasoning before gathering evidence."
+        )
+
+    parts.append("Begin by forming your base rate, then call update_belief_and_act.")
+    return "\n\n".join(parts)
 
 # --- Clients (lazily constructed so the module is import-safe) ---------------
 
@@ -388,31 +416,47 @@ def register_search_results(
     return header + "\n\n".join(lines)
 
 
-def summarize(question: str, instruction: str, docs: list[str]) -> str:
+def summarize(
+    question: str,
+    instruction: str,
+    docs: list[str],
+    resolution_criteria: str | None = None,
+) -> str:
     """Summarize selected search-result files with the sub-LLM (Gemini Flash).
 
-    `instruction` is the main agent's extraction prompt (what facts to pull). The
-    original `question` and the no-markets rule are injected independently so the
-    summarizer stays on task and never surfaces market odds the main agent must
-    ignore. Returns an error string (never raises) so a failure can't kill a run.
+    Acts as an assistant to the superforecaster: it extracts only the facts and
+    data from the documents relevant to the question's resolution, without adding
+    its own analysis. `instruction` is the main agent's specific extraction
+    request (what to pull this time). Returns an error string (never raises) so a
+    failure can't kill a run.
     """
     if not docs:
         return "No documents to summarize."
     instruction = instruction.strip() or (
         f"Extract any facts relevant to the forecasting question: {question}"
     )
+    criteria = (resolution_criteria or "").strip() or "(not separately specified)"
     combined = "\n\n---\n\n".join(docs)[:SUMMARIZER_MAX_DOC_CHARS]
     try:
         response = get_genai_client().models.generate_content(
             model=SUMMARIZER_MODEL,
-            contents=f"{instruction}\n\nDocuments:\n\n{combined}",
+            contents=f"Specifically: {instruction}\n\nSearch results:\n\n{combined}",
             config=types.GenerateContentConfig(
                 system_instruction=(
-                    "You are a research assistant extracting facts to help answer "
-                    f"this forecasting question: {question}\n\n{NO_MARKETS_RULE}\n\n"
-                    "Summarize only what the documents actually say that bears on the "
-                    "extraction request. Be concise and concrete; keep dates and "
-                    "figures. If the documents are irrelevant, say so plainly."
+                    "You are an assistant to a superforecaster. Extract the facts "
+                    "and data from the search results that are most relevant to "
+                    "predicting the outcome of this question.\n\n"
+                    f"Question: {question}\n"
+                    f"Resolution criteria: {criteria}\n\n"
+                    "Instructions:\n"
+                    "- Extract concrete facts, statistics, dates, and named-source "
+                    "expert opinions.\n"
+                    "- Note any quantitative data (prices, percentages, counts, "
+                    "trends).\n"
+                    "- Distinguish hard facts from speculation or editorial opinion.\n"
+                    "- Omit information not relevant to the resolution criteria.\n"
+                    "- Do NOT add your own analysis or forecast — only extract what "
+                    f"the sources say.\n\n{NO_MARKETS_RULE}"
                 ),
                 temperature=0.3,
                 max_output_tokens=SUMMARIZER_MAX_TOKENS,
@@ -432,7 +476,12 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def run_read_files(question: str, belief: dict, registry: dict[str, Path]) -> str:
+def run_read_files(
+    question: str,
+    belief: dict,
+    registry: dict[str, Path],
+    resolution_criteria: str | None = None,
+) -> str:
     """Resolve the agent's requested file ids, summarize them, return the result.
 
     Unknown ids are skipped and reported so the model self-corrects; an empty or
@@ -453,13 +502,19 @@ def run_read_files(question: str, belief: dict, registry: dict[str, Path]) -> st
         return f"No readable file ids in {requested or '[]'}. Available ids: {available}."
 
     notes = f" (ignored unknown ids: {', '.join(unknown)})" if unknown else ""
-    summary = summarize(question, belief.get("action_input") or "", docs)
+    summary = summarize(
+        question, belief.get("action_input") or "", docs, resolution_criteria
+    )
     logger.info("  read_files: %s%s", ", ".join(valid), notes)
     return f"Summary of {', '.join(valid)}{notes}:\n\n{summary}"
 
 
 def run_agent(
-    question: str, prior: float | None = None, max_steps: int = MAX_STEPS
+    question: str,
+    prior: float | None = None,
+    max_steps: int = MAX_STEPS,
+    background: str | None = None,
+    resolution_criteria: str | None = None,
 ) -> dict:
     """Run a single forecasting agent loop and return its final belief.
 
@@ -501,7 +556,13 @@ def run_agent(
     contents: list[types.Content] = [
         types.Content(
             role="user",
-            parts=[types.Part(text=build_initial_message(question, prior))],
+            parts=[
+                types.Part(
+                    text=build_initial_message(
+                        question, prior, background, resolution_criteria
+                    )
+                )
+            ],
         )
     ]
     probability = 0.5  # fallback prior if the loop exits unexpectedly
@@ -566,7 +627,9 @@ def run_agent(
                 break
 
             if action == "read_files":
-                result = run_read_files(question, belief, registry)
+                result = run_read_files(
+                    question, belief, registry, resolution_criteria
+                )
             else:  # 'web_search' (and any unexpected action): run a new search
                 search_index += 1
                 results, error = brave_search(belief.get("action_input") or question)
@@ -684,16 +747,19 @@ def aggregate_forecasts(
     prior: float | None = None,
     num_trials: int = NUM_TRIALS,
     category: str | None = None,
+    background: str | None = None,
+    resolution_criteria: str | None = None,
 ) -> ForecastResult:
     """Run the agent `num_trials` times and combine results via a logit-space mean.
 
     Averaging in log-odds (logit) space is more principled than averaging raw
     probabilities: it treats evidence additively and is symmetric around 0.5.
-    An optional `prior` anchor (a probability in [0, 1]) is forwarded to every
-    run. `category` (e.g. a Polymarket tag like "politics") is the source key for
-    calibration: if a fit has been saved, the aggregate is also calibrated for it.
-    Returns a `ForecastResult` with the raw aggregate, the calibrated aggregate
-    (when available), the per-trial spread, and a synthesized briefing.
+    An optional `prior` anchor (a probability in [0, 1]) plus optional `background`
+    and `resolution_criteria` context are forwarded to every run. `category`
+    (e.g. a Polymarket tag like "politics") is the source key for calibration: if
+    a fit has been saved, the aggregate is also calibrated for it. Returns a
+    `ForecastResult` with the raw aggregate, the calibrated aggregate (when
+    available), the per-trial spread, and a synthesized briefing.
     """
     logger.info(
         "Forecasting in %d trials | model=%s | prior=%s | question: %s",
@@ -708,7 +774,12 @@ def aggregate_forecasts(
     for trial in range(1, num_trials + 1):
         logger.info("=== Trial %d/%d ===", trial, num_trials)
         trial_start = time.perf_counter()
-        belief = run_agent(question, prior=prior)
+        belief = run_agent(
+            question,
+            prior=prior,
+            background=background,
+            resolution_criteria=resolution_criteria,
+        )
         beliefs.append(belief)
         logger.info(
             "Trial %d/%d result: p=%.3f (%.1fs)",
@@ -756,6 +827,8 @@ def save_run(
     result: ForecastResult,
     prior: float | None = None,
     num_trials: int | None = None,
+    background: str | None = None,
+    resolution_criteria: str | None = None,
 ) -> Path:
     """Write a forecast run to RUNS_DIR as JSON so the decision is not lost."""
     RUNS_DIR.mkdir(exist_ok=True)
@@ -765,6 +838,8 @@ def save_run(
     payload = {
         "timestamp": now.isoformat(),
         "question": question,
+        "background": background,
+        "resolution_criteria": resolution_criteria,
         "category": result.category,  # calibration source key
         "outcome": None,  # fill in via --resolve once the question resolves
         "prior": prior,
@@ -918,6 +993,18 @@ def main() -> None:
         "key. Used to calibrate the aggregate and recorded on the saved run.",
     )
     parser.add_argument(
+        "--background",
+        default=None,
+        help="Optional background context shown to the forecaster under the "
+        "'Background and resolution criteria' heading.",
+    )
+    parser.add_argument(
+        "--resolution-criteria",
+        default=None,
+        help="Optional resolution criteria — how the question settles YES/NO. "
+        "Shown to the forecaster and the search summarizer.",
+    )
+    parser.add_argument(
         "--resolve",
         metavar="RUN_JSON",
         help="Record an outcome on a saved run (pair with --outcome), then exit.",
@@ -973,9 +1060,21 @@ def main() -> None:
         )
 
     result = aggregate_forecasts(
-        args.question, prior=args.prior, num_trials=args.trials, category=args.category
+        args.question,
+        prior=args.prior,
+        num_trials=args.trials,
+        category=args.category,
+        background=args.background,
+        resolution_criteria=args.resolution_criteria,
     )
-    saved_path = save_run(args.question, result, prior=args.prior, num_trials=args.trials)
+    saved_path = save_run(
+        args.question,
+        result,
+        prior=args.prior,
+        num_trials=args.trials,
+        background=args.background,
+        resolution_criteria=args.resolution_criteria,
+    )
 
     spread = ", ".join(f"{p:.2f}" for p in result.trial_probabilities)
     print("\n" + "=" * 72)

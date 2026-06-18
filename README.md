@@ -76,10 +76,16 @@ uv run forecaster.py --prior 0.10
 
 # Your own question, with a prior and a custom number of trials:
 uv run forecaster.py "Will X happen before 2027?" --prior 0.62 --trials 3
+
+# Add structured context (shown under "Background and resolution criteria"):
+uv run forecaster.py "Will X happen before 2027?" \
+  --background "X has been attempted 3 times since 2020." \
+  --resolution-criteria "Resolves YES if X is officially confirmed before 2027-01-01."
 ```
 
-The question is an optional positional argument; `--prior` and `--trials` are
-optional flags. You can also call the API directly from Python:
+The question is an optional positional argument; `--prior`, `--trials`,
+`--background`, and `--resolution-criteria` are optional flags. `background` and
+`resolution_criteria` are shown to the forecaster and the search summarizer. You can also call the API directly from Python:
 
 ```python
 from forecaster import aggregate_forecasts
