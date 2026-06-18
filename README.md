@@ -92,6 +92,27 @@ print(result.summary)       # synthesized briefing of the argument
 result = aggregate_forecasts("Will event X happen before date Y?", prior=0.62)
 ```
 
+### Finding markets to forecast
+
+`polymarket.py` lists open Polymarket events by liquidity and time-to-resolution
+(a candidate list to forecast). It reads the public Gamma API — no key required.
+
+```bash
+# Events with >= $50k liquidity resolving within 7 days, most liquid first:
+uv run polymarket.py --min-liquidity 50000 --days 7
+
+# Cap the count and emit raw JSON instead of the readable listing:
+uv run polymarket.py --min-liquidity 50000 --days 7 --limit 20 --json
+```
+
+```python
+from polymarket import fetch_markets
+
+events = fetch_markets(min_liquidity=50000, within_days=7)
+# each event: id, slug, title, endDate, liquidity, volume,
+# and markets[] = {question, prices: [(outcome, implied_probability), ...]}
+```
+
 ### Logging
 
 Progress is logged via the standard `logging` module. The default `INFO` level
