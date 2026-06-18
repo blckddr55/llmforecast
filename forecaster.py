@@ -51,6 +51,10 @@ load_dotenv(ENV_PATH)
 # Saved forecast records (one JSON per run) so decisions aren't lost.
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
+# Persisted hierarchical-Platt calibration fit (written by --calibrate, applied
+# to new forecasts keyed on question category).
+CALIBRATION_PATH = Path(__file__).resolve().parent / "calibration_fit.json"
+
 # --- Configuration -----------------------------------------------------------
 
 MODEL = "gemini-3.5-flash"  # latest GA Gemini generation (newer than any 3.x Pro preview)
@@ -595,9 +599,15 @@ def run_agent(
 class ForecastResult:
     """Aggregated forecast plus a model-written briefing of the argument."""
 
-    probability: float  # aggregated (logit-space mean), in [0.05, 0.95]
+    probability: float  # raw aggregate (logit-space mean), in [0.05, 0.95]
     trials: list[dict]  # per-trial final beliefs (probability, evidence, reasoning)
     summary: str  # synthesized "case for / case against / bottom line"
+    # Calibrated aggregate (hierarchical Platt, keyed on `category`); None when no
+    # calibration fit has been saved yet. Kept SEPARATE from `probability` so the
+    # raw value still feeds future calibration fits (calibrating on an already-
+    # calibrated number would double-correct).
+    calibrated_probability: float | None = None
+    category: str | None = None  # question category — the calibration source key
 
     @property
     def trial_probabilities(self) -> list[float]:
@@ -656,16 +666,34 @@ def summarize_forecast(
     return (response.text or "").strip()
 
 
+def _apply_calibration(probability: float, category: str | None) -> float | None:
+    """Apply the persisted calibration fit to a raw aggregate, if one exists.
+
+    Returns the calibrated probability, or None when no fit has been saved yet.
+    The source key is the question's `category`; a category unseen at fit time
+    shrinks to the global fit (offset 0) inside `calibration.apply`.
+    """
+    if not CALIBRATION_PATH.exists():
+        return None
+    fit = calibration.load_fit(CALIBRATION_PATH)
+    return float(calibration.apply(probability, category or "uncategorized", fit))
+
+
 def aggregate_forecasts(
-    question: str, prior: float | None = None, num_trials: int = NUM_TRIALS
+    question: str,
+    prior: float | None = None,
+    num_trials: int = NUM_TRIALS,
+    category: str | None = None,
 ) -> ForecastResult:
     """Run the agent `num_trials` times and combine results via a logit-space mean.
 
     Averaging in log-odds (logit) space is more principled than averaging raw
     probabilities: it treats evidence additively and is symmetric around 0.5.
     An optional `prior` anchor (a probability in [0, 1]) is forwarded to every
-    run. Returns a `ForecastResult` with the aggregated probability, the per-trial
-    spread, and a synthesized briefing of the overall argument.
+    run. `category` (e.g. a Polymarket tag like "politics") is the source key for
+    calibration: if a fit has been saved, the aggregate is also calibrated for it.
+    Returns a `ForecastResult` with the raw aggregate, the calibrated aggregate
+    (when available), the per-trial spread, and a synthesized briefing.
     """
     logger.info(
         "Forecasting in %d trials | model=%s | prior=%s | question: %s",
@@ -700,12 +728,23 @@ def aggregate_forecasts(
         time.perf_counter() - overall_start,
     )
 
+    calibrated = _apply_calibration(aggregated, category)
+    if calibrated is not None:
+        logger.info(
+            "Calibrated (category=%s): %.3f -> %.3f",
+            category or "uncategorized",
+            aggregated,
+            calibrated,
+        )
+
     logger.info("Synthesizing final briefing...")
     summary = summarize_forecast(question, beliefs, aggregated, prior)
     return ForecastResult(
         probability=aggregated,
         trials=beliefs,
         summary=summary,
+        calibrated_probability=calibrated,
+        category=category,
     )
 
 
@@ -726,12 +765,14 @@ def save_run(
     payload = {
         "timestamp": now.isoformat(),
         "question": question,
+        "category": result.category,  # calibration source key
         "outcome": None,  # fill in via --resolve once the question resolves
         "prior": prior,
         "model": MODEL,
         "thinking_level": THINKING_LEVEL,
         "num_trials": num_trials if num_trials is not None else len(result.trials),
-        "probability": result.probability,
+        "probability": result.probability,  # raw aggregate (feeds calibration fits)
+        "calibrated_probability": result.calibrated_probability,
         "trial_probabilities": result.trial_probabilities,
         "summary": result.summary,
         "trials": result.trials,
@@ -765,12 +806,19 @@ def resolve_run(run_path: str | Path, outcome: int) -> Path:
     return path
 
 
-def calibrate_across_sources(lam: float = 1.0) -> dict:
-    """Fit hierarchical Platt scaling across all resolved runs.
+def _run_category(run: dict) -> str:
+    """The calibration source key for a run — its question category."""
+    return run.get("category") or "uncategorized"
 
-    Each run's `model` is treated as a calibration "source", so the fit learns a
-    global slope/intercept plus a per-model offset (L2-regularized toward zero).
-    Returns a report with the fitted parameters, the leave-one-out calibrated
+
+def calibrate_across_sources(lam: float = 1.0) -> dict:
+    """Fit hierarchical Platt scaling across all resolved runs, keyed on category.
+
+    Each run's question `category` is the calibration "source", so the fit learns
+    a global slope/intercept plus a per-category offset (L2-regularized toward
+    zero — categories with little data shrink to the pooled fit). The fitted
+    parameters are written to CALIBRATION_PATH so new forecasts can be calibrated.
+    Returns a report with the parameters, the leave-one-out calibrated
     probabilities, and the underlying arrays for scoring.
     """
     runs = load_resolved_runs()
@@ -779,35 +827,54 @@ def calibrate_across_sources(lam: float = 1.0) -> dict:
             f"Need at least 2 resolved runs to calibrate; found {len(runs)}. "
             "Resolve runs first: forecaster.py --resolve <runs/...json> --outcome 0|1"
         )
-    models = sorted({r["model"] for r in runs})
-    source_of = {model: i for i, model in enumerate(models)}
+    sources = sorted({_run_category(r) for r in runs})
+    source_of = {category: i for i, category in enumerate(sources)}
     p_hat = np.array([float(r["probability"]) for r in runs])
     y = np.array([int(r["outcome"]) for r in runs])
-    source_idx = np.array([source_of[r["model"]] for r in runs])
+    source_idx = np.array([source_of[_run_category(r)] for r in runs])
 
     calibrated = calibration.loocv_calibrate(p_hat, y, source_idx, lam=lam)
     a, b, delta = calibration.fit(
-        calibration.safe_logit(p_hat), y, source_idx, len(models), lam
+        calibration.safe_logit(p_hat), y, source_idx, len(sources), lam
     )
+
+    # Persist the fit so aggregate_forecasts can calibrate new predictions. The
+    # source_of map is saved with the offsets so categories stay aligned.
+    fit = {
+        "a": float(a),
+        "b": float(b),
+        "delta": [float(d) for d in delta],
+        "source_of": source_of,
+        "sources": sources,
+        "lam": lam,
+        "eps": calibration.EPS,
+        "n": len(runs),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    CALIBRATION_PATH.write_text(
+        json.dumps(fit, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
     return {
         "n": len(runs),
-        "models": models,
+        "sources": sources,
         "p_hat": p_hat,
         "y": y,
         "calibrated": calibrated,
         "a": float(a),
         "b": float(b),
         "delta": [float(d) for d in delta],
+        "path": CALIBRATION_PATH,
     }
 
 
 def print_calibration_report(report: dict) -> None:
-    """Print the per-source offsets and leave-one-out calibration metrics."""
-    print(f"Resolved runs: {report['n']} | sources (models): {len(report['models'])}")
+    """Print the per-category offsets and leave-one-out calibration metrics."""
+    print(f"Resolved runs: {report['n']} | sources (categories): {len(report['sources'])}")
     print(f"Global fit: slope a={report['a']:.3f}, intercept b={report['b']:.3f}")
-    print("Per-source offsets (delta_s):")
-    for model, d in zip(report["models"], report["delta"]):
-        print(f"  {model:<26} {d:+.3f}")
+    print("Per-category offsets (delta_s):")
+    for category, d in zip(report["sources"], report["delta"]):
+        print(f"  {category:<26} {d:+.3f}")
     p_hat, y, cal = report["p_hat"], report["y"], report["calibrated"]
     print("Leave-one-out quality (lower is better):")
     print(
@@ -818,6 +885,7 @@ def print_calibration_report(report: dict) -> None:
         f"  Brier    : raw {calibration.brier(p_hat, y):.4f}  ->  "
         f"calibrated {calibration.brier(cal, y):.4f}"
     )
+    print(f"Saved fit to: {report['path'].name}")
 
 
 # --- Example execution -------------------------------------------------------
@@ -844,6 +912,12 @@ def main() -> None:
         help=f"Independent runs to aggregate (default: {NUM_TRIALS}).",
     )
     parser.add_argument(
+        "--category",
+        default=None,
+        help="Question category (e.g. a Polymarket tag) — the calibration source "
+        "key. Used to calibrate the aggregate and recorded on the saved run.",
+    )
+    parser.add_argument(
         "--resolve",
         metavar="RUN_JSON",
         help="Record an outcome on a saved run (pair with --outcome), then exit.",
@@ -857,7 +931,8 @@ def main() -> None:
     parser.add_argument(
         "--calibrate",
         action="store_true",
-        help="Fit hierarchical Platt scaling across resolved runs (per model), then exit.",
+        help="Fit hierarchical Platt scaling across resolved runs (per question "
+        "category), save the fit, then exit.",
     )
     parser.add_argument(
         "--lam",
@@ -898,7 +973,7 @@ def main() -> None:
         )
 
     result = aggregate_forecasts(
-        args.question, prior=args.prior, num_trials=args.trials
+        args.question, prior=args.prior, num_trials=args.trials, category=args.category
     )
     saved_path = save_run(args.question, result, prior=args.prior, num_trials=args.trials)
 
@@ -910,6 +985,11 @@ def main() -> None:
         f"Aggregated probability: {result.probability:.3f}   "
         f"({args.trials} trials: {spread})"
     )
+    if result.calibrated_probability is not None:
+        print(
+            f"Calibrated probability: {result.calibrated_probability:.3f}   "
+            f"(category: {result.category or 'uncategorized'})"
+        )
     print(f"Saved to: {saved_path.relative_to(Path.cwd()) if saved_path.is_relative_to(Path.cwd()) else saved_path}")
 
 

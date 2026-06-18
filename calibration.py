@@ -16,6 +16,9 @@ calibration is evaluated honestly with leave-one-out cross-validation.
 Run with:  uv run calibration.py
 """
 
+import json
+from pathlib import Path
+
 import numpy as np
 from scipy.optimize import minimize
 from scipy.special import expit, logit
@@ -33,6 +36,40 @@ def calibrate(logit_p, a, b, delta, source_idx):
     """Apply the calibration map, returning probabilities clipped to (0, 1)."""
     z = a * logit_p + b + delta[source_idx]
     return np.clip(expit(z), EPS, 1.0 - EPS)
+
+
+def apply(p, source, fit: dict):
+    """Apply a saved hierarchical-Platt fit to raw probabilities.
+
+    `p` is a scalar or array of raw probabilities and `source` the matching
+    source category — a single value applied to all of `p`, or a sequence aligned
+    with it. `fit` is the dict written at fit time (see `load_fit`), holding `a`,
+    `b`, `delta` (per-source offsets), `source_of` (category -> index) and `eps`.
+
+    A source not seen at fit time gets offset 0: it shrinks to the pooled global
+    fit, which is the whole point of the hierarchical model. Returns calibrated
+    probabilities clipped to (0, 1) — a float for scalar `p`, else an array.
+    """
+    a, b = fit["a"], fit["b"]
+    delta = np.asarray(fit["delta"], dtype=float)
+    source_of = fit["source_of"]
+    eps = float(fit.get("eps", EPS))
+
+    p_arr = np.atleast_1d(np.asarray(p, dtype=float))
+    sources = list(np.atleast_1d(np.asarray(source, dtype=object)))
+    if len(sources) == 1:
+        sources = sources * len(p_arr)
+    offsets = np.array(
+        [delta[source_of[s]] if s in source_of else 0.0 for s in sources], dtype=float
+    )
+    z = a * safe_logit(p_arr, eps) + b + offsets
+    out = np.clip(expit(z), eps, 1.0 - eps)
+    return out if np.ndim(p) else float(out[0])
+
+
+def load_fit(path) -> dict:
+    """Load a persisted calibration fit (written by `forecaster.py --calibrate`)."""
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def negative_log_likelihood(params, logit_p, y, source_idx, n_sources, lam):

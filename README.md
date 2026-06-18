@@ -137,21 +137,30 @@ exits.
 
 ## Calibration
 
-Forecasts can be calibrated across **sources** (the model that produced each run)
-with hierarchical Platt scaling (`calibration.py`):
+Forecasts are calibrated with hierarchical Platt scaling (`calibration.py`), keyed
+on the **question category** (e.g. a Polymarket tag) as the source:
 
 ```bash
-# 1. Record the actual outcome on a resolved question:
+# 1. Tag a forecast with its category (recorded on the saved run):
+uv run forecaster.py "Will X happen before 2027?" --category politics
+
+# 2. Record the actual outcome once the question resolves:
 uv run forecaster.py --resolve runs/<file>.json --outcome 1
 
-# 2. Fit the calibrator across all resolved runs and report the improvement:
+# 3. Fit the calibrator across all resolved runs, report it, and save the fit:
 uv run forecaster.py --calibrate
 ```
 
-The fit learns a global slope/intercept plus a per-source (per-model) offset that
-is L2-regularized toward zero (`--lam`, default 1.0), and reports leave-one-out
-log loss and Brier before vs. after. `calibration.py` also runs standalone
-(`uv run calibration.py`) on synthetic data.
+The fit learns a global slope/intercept plus a per-category offset that is L2-
+regularized toward zero (`--lam`, default 1.0) — categories with little data
+shrink to the pooled global fit. It reports leave-one-out log loss and Brier
+before vs. after, and writes the parameters to `calibration_fit.json`.
+
+Once that fit exists, every new forecast is **also** calibrated for its
+`--category`: the run records both the raw `probability` (which feeds future
+fits — calibration is never applied on top of itself) and a `calibrated_probability`.
+A category unseen at fit time falls back to the global fit (offset 0).
+`calibration.py` also runs standalone (`uv run calibration.py`) on synthetic data.
 
 ## Configuration
 
