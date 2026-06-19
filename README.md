@@ -168,32 +168,50 @@ fits — calibration is never applied on top of itself) and a `calibrated_probab
 A category unseen at fit time falls back to the global fit (offset 0).
 `calibration.py` also runs standalone (`uv run calibration.py`) on synthetic data.
 
-### Fast calibration data: World Cup matches
+### Building calibration data from Polymarket
 
 Calibration needs *resolved* forecasts, and most questions take months to settle.
-Match-winner markets resolve in hours, so `train_worldcup.py` uses them to build a
-calibration set quickly — it forecasts each upcoming match's binary "Will {team}
-win?" markets **independently** (no market prior; markets are ignored as evidence)
-and can auto-resolve them from Polymarket once the matches finish.
+Two drivers forecast Polymarket markets to build a calibration set, then
+auto-resolve them from Polymarket once they settle. Both forecast each market
+**independently** (no market prior — markets are ignored as evidence) and save a
+run per market tagged with a `--category`.
+
+**`train_markets.py`** — general, selects markets by Polymarket **tag**. Pool
+several tags into one calibration category (e.g. politics + geopolitics):
 
 ```bash
-# Preview which match markets would be forecast (no LLM calls):
-uv run train_worldcup.py --days 3 --dry-run
+# Preview (no LLM calls); tags are fetched server-side and de-duplicated:
+uv run train_markets.py --tags politics,geopolitics --category politics --dry-run
 
-# Forecast the next few matches (each saved as a run tagged --category world-cup):
+# Forecast competitive binary markets (price within --min/--max-price), most
+# liquid first, capped per event and overall:
+uv run train_markets.py --tags politics,geopolitics --category politics --limit 10
+```
+
+**`train_worldcup.py`** — a sports preset that forecasts each upcoming match's
+binary "Will {team} win?" markets (match-winner markets resolve in *hours*, so
+they build a calibration set fast):
+
+```bash
 uv run train_worldcup.py --days 3 --limit 4 --trials 3
+```
 
-# After the matches play out, record outcomes automatically from Gamma:
-uv run train_worldcup.py --resolve
+Then, for either driver:
 
-# Then fit (needs enough resolved runs):
+```bash
+# After the markets settle, record outcomes automatically from Gamma:
+uv run train_markets.py --resolve        # resolves ALL pending Polymarket runs
+
+# Fit once enough runs are resolved:
 uv run forecaster.py --calibrate
 ```
 
 Each run stores a `market` reference (event slug + condition id) and the
-`market_price` (recorded only for comparison — it is **not** used as a prior), so
-`--resolve` can map it back to the settled outcome. Cost scales as matches ×
-2 markets × `--trials`, so start with `--dry-run` and a small `--limit`.
+`market_price` (recorded only for comparison — **not** used as a prior), so
+`--resolve` maps it back to the settled outcome. Cost scales as markets ×
+`--trials`, so start with `--dry-run` and a small `--limit`. Pooling tags under
+one `--category` calibrates them together (their own bias offset in the shared
+hierarchical fit); see [Calibration](#calibration).
 
 ## Configuration
 
