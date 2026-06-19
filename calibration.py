@@ -138,6 +138,13 @@ def brier(p, y):
 
 
 def main() -> None:
+    """Standalone demo / smoke test (run via `uv run calibration.py`).
+
+    Not part of the production pipeline — the live path is
+    `forecaster.py --calibrate`. This fabricates an overconfident, per-source-
+    biased forecaster on synthetic data and shows that calibration lowers log
+    loss and Brier, exercising the module's functions on a known-answer case.
+    """
     rng = np.random.default_rng(0)
     n, n_sources = 200, 3
 
