@@ -91,6 +91,11 @@ def make_task(event: dict, market: dict) -> dict:
     }
 
 
+def _event_tag_slugs(event: dict) -> set:
+    """The set of tag slugs an event carries."""
+    return {t.get("slug") for t in event.get("tags") or []}
+
+
 def fetch_tag_markets(
     tags: list[str],
     within_days: int,
@@ -99,13 +104,15 @@ def fetch_tag_markets(
     max_price: float = 0.95,
     max_per_event: int = 5,
     limit: int | None = None,
+    exclude_tags: list[str] | None = None,
 ) -> list[dict]:
     """Fetch competitive binary markets from events carrying any of `tags`.
 
-    Events are fetched per tag (server-side) and de-duplicated. Within each event
-    we keep open binary Yes/No markets whose price is in [min_price, max_price]
-    (skipping near-decided ones), most-liquid first up to `max_per_event`. Returns
-    forecasting tasks (see `make_task`), capped at `limit`.
+    Events are fetched per tag (server-side) and de-duplicated. An event carrying
+    any slug in `exclude_tags` is dropped (e.g. "tweets-markets" novelty markets).
+    Within each kept event we keep open binary Yes/No markets whose price is in
+    [min_price, max_price] (skipping near-decided ones), most-liquid first up to
+    `max_per_event`. Returns forecasting tasks (see `make_task`), capped at `limit`.
     """
     now = datetime.now(timezone.utc)
     base = {
@@ -117,6 +124,7 @@ def fetch_tag_markets(
         "order": "liquidity",
         "ascending": "false",
     }
+    excluded = set(exclude_tags or [])
     events: dict = {}
     for tag in tags:
         for e in polymarket.fetch_events_raw({**base, "tag_slug": tag}):
@@ -124,6 +132,8 @@ def fetch_tag_markets(
 
     tasks = []
     for event in events.values():
+        if excluded & _event_tag_slugs(event):
+            continue
         eligible = []
         for market in event.get("markets") or []:
             if market.get("closed") or not _is_binary(market):
@@ -243,6 +253,9 @@ def main() -> None:
                         help="skip markets priced above this — near-decided (default: 0.95)")
     parser.add_argument("--max-per-event", type=int, default=5,
                         help="most-liquid markets to take per event (default: 5)")
+    parser.add_argument("--exclude-tags", default="tweets-markets",
+                        help="comma-separated tag slugs whose events to drop "
+                        "(default: tweets-markets; pass '' to keep everything)")
     parser.add_argument("--limit", type=int, default=None,
                         help="cap the total number of markets forecast")
     parser.add_argument("--trials", type=int, default=3,
@@ -268,9 +281,11 @@ def main() -> None:
         parser.error("--tags is required (e.g. --tags politics,geopolitics)")
     category = args.category or tags[0]
 
+    exclude_tags = [t.strip() for t in args.exclude_tags.split(",") if t.strip()]
     tasks = fetch_tag_markets(
         tags, args.days, args.min_liquidity,
         args.min_price, args.max_price, args.max_per_event, args.limit,
+        exclude_tags=exclude_tags,
     )
     logger.info("Found %d market(s) for tags=%s -> category=%s.", len(tasks), tags, category)
 

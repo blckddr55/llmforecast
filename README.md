@@ -188,6 +188,10 @@ uv run train_markets.py --tags politics,geopolitics --category politics --dry-ru
 uv run train_markets.py --tags politics,geopolitics --category politics --limit 10
 ```
 
+Events tagged `tweets-markets` (novelty "how many tweets" markets) are dropped by
+default; control this with `--exclude-tags <slugs>` (pass `--exclude-tags ''` to
+keep everything).
+
 **`train_worldcup.py`** — a sports preset that forecasts each upcoming match's
 binary "Will {team} win?" markets (match-winner markets resolve in *hours*, so
 they build a calibration set fast):
