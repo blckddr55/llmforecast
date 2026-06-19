@@ -141,6 +141,13 @@ aggregated probability, and the synthesized briefing — plus an `outcome` field
 fill in when the question resolves — so decisions aren't lost when the process
 exits.
 
+Each trial also records the full **decision process**: a `steps` trajectory (the
+probability, action, and reasoning at every step), a `sources` map
+(`search_X_result_Y → {title, url, query}`, so evidence citations stay resolvable
+after the scratch files are deleted), a `stats` block (`steps_used`, `n_searches`,
+`n_reads`, `terminated_by`, `seconds`), and per-trial `usage` (token counts). A
+run-level `usage` sums all trials plus the briefing, giving the exact token cost.
+
 ## Calibration
 
 Forecasts are calibrated with hierarchical Platt scaling (`calibration.py`), keyed

@@ -390,13 +390,17 @@ def register_search_results(
     search_index: int,
     scratch: Path,
     registry: dict[str, Path],
+    sources: dict | None = None,
+    query: str | None = None,
 ) -> str:
     """Write each result's full content to a file, register its id, and return
     the short snippet list (ids + title + url + one-line snippet) for context.
 
     This is the progressive-disclosure split: only the short snippets enter the
     agent's context; the full text lives in `<scratch>/<id>.md` until the agent
-    asks to read it.
+    asks to read it. When `sources` is given, each id is recorded as
+    {title, url, query} so the run's evidence citations stay resolvable after the
+    scratch files are deleted.
     """
     if not results:
         return "No results found."
@@ -406,6 +410,12 @@ def register_search_results(
         path = scratch / f"{file_id}.md"
         path.write_text(result["full_content"], encoding="utf-8")
         registry[file_id] = path
+        if sources is not None:
+            sources[file_id] = {
+                "title": result["title"],
+                "url": result["url"],
+                "query": query,
+            }
         snippet = result["short_snippet"] or "(no snippet)"
         lines.append(f"[{file_id}] {result['title']}\n{result['url']}\n{snippet}")
     header = (
@@ -421,6 +431,7 @@ def summarize(
     instruction: str,
     docs: list[str],
     resolution_criteria: str | None = None,
+    usage: dict | None = None,
 ) -> str:
     """Summarize selected search-result files with the sub-LLM (Gemini Flash).
 
@@ -463,6 +474,8 @@ def summarize(
                 thinking_config=types.ThinkingConfig(thinking_level="low"),
             ),
         )
+        if usage is not None:
+            _add_usage(usage, response)
         return (response.text or "").strip() or "Summary was empty."
     except Exception as exc:
         logger.warning("summarization failed: %s", exc)
@@ -476,11 +489,27 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _new_usage() -> dict:
+    return {"prompt": 0, "output": 0, "thinking": 0, "total": 0}
+
+
+def _add_usage(acc: dict, response) -> None:
+    """Add one response's token usage to an accumulator (best-effort)."""
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        return
+    acc["prompt"] += getattr(um, "prompt_token_count", 0) or 0
+    acc["output"] += getattr(um, "candidates_token_count", 0) or 0
+    acc["thinking"] += getattr(um, "thoughts_token_count", 0) or 0
+    acc["total"] += getattr(um, "total_token_count", 0) or 0
+
+
 def run_read_files(
     question: str,
     belief: dict,
     registry: dict[str, Path],
     resolution_criteria: str | None = None,
+    usage: dict | None = None,
 ) -> str:
     """Resolve the agent's requested file ids, summarize them, return the result.
 
@@ -503,7 +532,7 @@ def run_read_files(
 
     notes = f" (ignored unknown ids: {', '.join(unknown)})" if unknown else ""
     summary = summarize(
-        question, belief.get("action_input") or "", docs, resolution_criteria
+        question, belief.get("action_input") or "", docs, resolution_criteria, usage=usage
     )
     logger.info("  read_files: %s%s", ", ".join(valid), notes)
     return f"Summary of {', '.join(valid)}{notes}:\n\n{summary}"
@@ -582,11 +611,21 @@ def run_agent(
     registry: dict[str, Path] = {}
     search_index = 0
 
+    # Decision-process record: per-step trajectory, source provenance, counters,
+    # and token usage — attached to the returned belief for the saved run.
+    start = time.perf_counter()
+    trajectory: list[dict] = []
+    sources: dict = {}
+    usage = _new_usage()
+    n_reads = 0
+    terminated_by = "no_call"
+
     try:
         for step in range(1, max_steps + 1):
             response = client.models.generate_content(
                 model=MODEL, contents=contents, config=config
             )
+            _add_usage(usage, response)
 
             calls = response.function_calls or []
             if not calls:
@@ -614,10 +653,29 @@ def run_agent(
             logger.debug("  evidence_for: %s", belief.get("evidence_for", []))
             logger.debug("  evidence_against: %s", belief.get("evidence_against", []))
 
+            trajectory.append(
+                {
+                    "step": step,
+                    "probability": probability,
+                    "confidence": belief.get("confidence"),
+                    "action": action,
+                    "action_input": belief.get("action_input"),
+                    "update_reasoning": belief.get("update_reasoning"),
+                    "read_file_ids": (
+                        list(belief.get("read_file_ids") or [])
+                        if action == "read_files"
+                        else []
+                    ),
+                    "n_evidence_for": len(belief.get("evidence_for") or []),
+                    "n_evidence_against": len(belief.get("evidence_against") or []),
+                }
+            )
+
             # Preserve the model's function-call turn.
             contents.append(response.candidates[0].content)
 
             if action == "submit" or step == max_steps:
+                terminated_by = "submit" if action == "submit" else "budget"
                 if action == "submit":
                     logger.info("  submit: %s", belief.get("action_input", ""))
                 else:
@@ -627,14 +685,16 @@ def run_agent(
                 break
 
             if action == "read_files":
+                n_reads += 1
                 result = run_read_files(
-                    question, belief, registry, resolution_criteria
+                    question, belief, registry, resolution_criteria, usage=usage
                 )
             else:  # 'web_search' (and any unexpected action): run a new search
                 search_index += 1
-                results, error = brave_search(belief.get("action_input") or question)
+                query = belief.get("action_input") or question
+                results, error = brave_search(query)
                 result = error or register_search_results(
-                    results, search_index, scratch, registry
+                    results, search_index, scratch, registry, sources, query
                 )
 
             # The function_response must echo call.name (the only tool) so Gemini
@@ -652,6 +712,17 @@ def run_agent(
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
+    # Attach the decision-process record (#1 trajectory, #2 provenance, #3 stats).
+    belief["steps"] = trajectory
+    belief["sources"] = sources
+    belief["stats"] = {
+        "steps_used": len(trajectory),
+        "n_searches": search_index,
+        "n_reads": n_reads,
+        "terminated_by": terminated_by,
+        "seconds": round(time.perf_counter() - start, 1),
+    }
+    belief["usage"] = usage
     return belief
 
 
@@ -671,6 +742,7 @@ class ForecastResult:
     # calibrated number would double-correct).
     calibrated_probability: float | None = None
     category: str | None = None  # question category — the calibration source key
+    usage: dict | None = None  # run-level token totals (all trials + briefing)
 
     @property
     def trial_probabilities(self) -> list[float]:
@@ -682,6 +754,7 @@ def summarize_forecast(
     beliefs: list[dict],
     aggregated: float,
     prior: float | None = None,
+    usage: dict | None = None,
 ) -> str:
     """Synthesize the trials into one short briefing via a final model call."""
     trial_blocks = []
@@ -726,6 +799,8 @@ def summarize_forecast(
             thinking_config=types.ThinkingConfig(thinking_level="low"),
         ),
     )
+    if usage is not None:
+        _add_usage(usage, response)
     return (response.text or "").strip()
 
 
@@ -770,6 +845,7 @@ def aggregate_forecasts(
     )
     overall_start = time.perf_counter()
 
+    total_usage = _new_usage()
     beliefs = []
     for trial in range(1, num_trials + 1):
         logger.info("=== Trial %d/%d ===", trial, num_trials)
@@ -781,12 +857,15 @@ def aggregate_forecasts(
             resolution_criteria=resolution_criteria,
         )
         beliefs.append(belief)
+        for key in total_usage:
+            total_usage[key] += belief.get("usage", {}).get(key, 0)
         logger.info(
-            "Trial %d/%d result: p=%.3f (%.1fs)",
+            "Trial %d/%d result: p=%.3f (%.1fs, %d tokens)",
             trial,
             num_trials,
             belief["probability"],
             time.perf_counter() - trial_start,
+            belief.get("usage", {}).get("total", 0),
         )
 
     probabilities = [float(b["probability"]) for b in beliefs]
@@ -809,13 +888,21 @@ def aggregate_forecasts(
         )
 
     logger.info("Synthesizing final briefing...")
-    summary = summarize_forecast(question, beliefs, aggregated, prior)
+    summary = summarize_forecast(question, beliefs, aggregated, prior, usage=total_usage)
+    logger.info(
+        "Total tokens: %d (prompt %d, output %d, thinking %d)",
+        total_usage["total"],
+        total_usage["prompt"],
+        total_usage["output"],
+        total_usage["thinking"],
+    )
     return ForecastResult(
         probability=aggregated,
         trials=beliefs,
         summary=summary,
         calibrated_probability=calibrated,
         category=category,
+        usage=total_usage,
     )
 
 
@@ -854,6 +941,7 @@ def save_run(
         "probability": result.probability,  # raw aggregate (feeds calibration fits)
         "calibrated_probability": result.calibrated_probability,
         "trial_probabilities": result.trial_probabilities,
+        "usage": result.usage,  # run-level token totals
         "summary": result.summary,
         "trials": result.trials,
         **(extra or {}),
