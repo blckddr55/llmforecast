@@ -22,6 +22,8 @@ import polymarket
 from train_markets import (
     _iso,
     _yes_price,
+    cap_to_events,
+    dedupe_tasks,
     forecast_tasks,
     print_tasks,
     resolve_pending,
@@ -52,7 +54,6 @@ def fetch_match_markets(
     within_days: int,
     min_liquidity: float,
     include_draws: bool = False,
-    limit_matches: int | None = None,
 ) -> list[dict]:
     """Return forecasting tasks for upcoming World Cup match-winner markets."""
     now = datetime.now(timezone.utc)
@@ -67,8 +68,6 @@ def fetch_match_markets(
         "ascending": "true",
     }
     matches = [e for e in polymarket.fetch_events_raw(filters) if _is_base_match(e)]
-    if limit_matches:
-        matches = matches[:limit_matches]
 
     tasks = []
     for event in matches:
@@ -128,10 +127,17 @@ def main() -> None:
         resolve_pending()
         return
 
-    tasks = fetch_match_markets(
-        args.days, args.min_liquidity, args.include_draws, args.limit
+    tasks = fetch_match_markets(args.days, args.min_liquidity, args.include_draws)
+    found = len(tasks)
+    tasks = dedupe_tasks(tasks)
+    new_count = len(tasks)
+    if args.limit:
+        tasks = cap_to_events(tasks, args.limit)  # --limit counts matches
+    logger.info(
+        "Found %d match-winner market(s) within %d day(s) | %d new "
+        "(%d already in runs/), forecasting %d.",
+        found, args.days, new_count, found - new_count, len(tasks),
     )
-    logger.info("Found %d match-winner market(s) within %d day(s).", len(tasks), args.days)
 
     if args.dry_run or not tasks:
         print_tasks(tasks, args.trials, args.category)

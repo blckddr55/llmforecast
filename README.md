@@ -217,6 +217,12 @@ Each run stores a `market` reference (event slug + condition id) and the
 one `--category` calibrates them together (their own bias offset in the shared
 hierarchical fit); see [Calibration](#calibration).
 
+**Re-runs skip what's done.** Both drivers de-duplicate against `runs/` by market
+condition id, so a market already forecast (whether pending or resolved) is not
+forecast again — only `--resolve` revisits it. `--limit` therefore counts *new*
+markets, so you can build the set incrementally: forecast a batch, resolve, run
+again to pick up the next batch.
+
 ## Configuration
 
 The knobs live at the top of `forecaster.py`:

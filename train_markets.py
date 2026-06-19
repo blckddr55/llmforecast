@@ -103,7 +103,6 @@ def fetch_tag_markets(
     min_price: float = 0.05,
     max_price: float = 0.95,
     max_per_event: int = 5,
-    limit: int | None = None,
     exclude_tags: list[str] | None = None,
 ) -> list[dict]:
     """Fetch competitive binary markets from events carrying any of `tags`.
@@ -112,7 +111,8 @@ def fetch_tag_markets(
     any slug in `exclude_tags` is dropped (e.g. "tweets-markets" novelty markets).
     Within each kept event we keep open binary Yes/No markets whose price is in
     [min_price, max_price] (skipping near-decided ones), most-liquid first up to
-    `max_per_event`. Returns forecasting tasks (see `make_task`), capped at `limit`.
+    `max_per_event`. Returns forecasting tasks (see `make_task`); the caller
+    de-duplicates against runs/ and applies any `--limit`.
     """
     now = datetime.now(timezone.utc)
     base = {
@@ -144,7 +144,7 @@ def fetch_tag_markets(
             eligible.append(market)
         eligible.sort(key=lambda m: _to_float(m.get("liquidityNum")), reverse=True)
         tasks.extend(make_task(event, m) for m in eligible[:max_per_event])
-    return tasks[:limit] if limit else tasks
+    return tasks
 
 
 def forecast_tasks(tasks: list[dict], trials: int, category: str) -> list:
@@ -223,6 +223,52 @@ def resolve_pending() -> None:
     logger.info("Resolved %d run(s); %d still pending.", resolved, still_pending)
 
 
+def forecasted_condition_ids() -> set:
+    """Condition ids of markets already saved to runs/ (any status).
+
+    Used to avoid re-forecasting a market we've already recorded for calibration.
+    Resolved runs are included — once forecast, a market is never re-run (it is
+    still picked up by `resolve_pending`, which scans runs/ independently).
+    """
+    seen = set()
+    for path in forecaster.RUNS_DIR.glob("*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        cid = (data.get("market") or {}).get("condition_id")
+        if cid:
+            seen.add(cid)
+    return seen
+
+
+def dedupe_tasks(tasks: list[dict]) -> list[dict]:
+    """Drop tasks whose market already has a saved run, plus any in-batch repeats."""
+    seen = forecasted_condition_ids()
+    out = []
+    for task in tasks:
+        cid = task["market"].get("condition_id")
+        if cid and cid in seen:
+            continue
+        if cid:
+            seen.add(cid)
+        out.append(task)
+    return out
+
+
+def cap_to_events(tasks: list[dict], n: int) -> list[dict]:
+    """Keep all tasks belonging to the first `n` distinct events (e.g. matches)."""
+    out, events = [], []
+    for task in tasks:
+        slug = task["market"].get("event_slug")
+        if slug not in events:
+            if len(events) >= n:
+                break
+            events.append(slug)
+        out.append(task)
+    return out
+
+
 def print_tasks(tasks: list[dict], trials: int, category: str) -> None:
     """Print the markets that would be forecast (for --dry-run / empty results)."""
     for task in tasks:
@@ -257,7 +303,8 @@ def main() -> None:
                         help="comma-separated tag slugs whose events to drop "
                         "(default: tweets-markets; pass '' to keep everything)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="cap the total number of markets forecast")
+                        help="cap the number of NEW markets forecast this run "
+                        "(applied after de-duplicating against runs/)")
     parser.add_argument("--trials", type=int, default=3,
                         help="independent runs aggregated per market (default: 3)")
     parser.add_argument("--dry-run", action="store_true",
@@ -284,10 +331,19 @@ def main() -> None:
     exclude_tags = [t.strip() for t in args.exclude_tags.split(",") if t.strip()]
     tasks = fetch_tag_markets(
         tags, args.days, args.min_liquidity,
-        args.min_price, args.max_price, args.max_per_event, args.limit,
+        args.min_price, args.max_price, args.max_per_event,
         exclude_tags=exclude_tags,
     )
-    logger.info("Found %d market(s) for tags=%s -> category=%s.", len(tasks), tags, category)
+    found = len(tasks)
+    tasks = dedupe_tasks(tasks)
+    new_count = len(tasks)
+    if args.limit:
+        tasks = tasks[: args.limit]
+    logger.info(
+        "Found %d market(s) for tags=%s -> category=%s | %d new "
+        "(%d already in runs/), forecasting %d.",
+        found, tags, category, new_count, found - new_count, len(tasks),
+    )
 
     if args.dry_run or not tasks:
         print_tasks(tasks, args.trials, category)
