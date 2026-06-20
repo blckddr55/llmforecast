@@ -105,8 +105,8 @@ def main() -> None:
                         help="minimum event liquidity in USD (default: 50000)")
     parser.add_argument("--limit", type=int, default=None,
                         help="cap the number of matches forecast")
-    parser.add_argument("--trials", type=int, default=3,
-                        help="independent runs aggregated per market (default: 3)")
+    parser.add_argument("--trials", type=int, default=5,
+                        help="independent runs aggregated per market (default: 5)")
     parser.add_argument("--category", default="world-cup",
                         help="calibration category recorded on each run (default: world-cup)")
     parser.add_argument("--include-draws", action="store_true",

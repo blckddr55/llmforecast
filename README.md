@@ -214,7 +214,7 @@ binary "Will {team} win?" markets (match-winner markets resolve in *hours*, so
 they build a calibration set fast):
 
 ```bash
-uv run train_worldcup.py --days 3 --limit 4 --trials 3
+uv run train_worldcup.py --days 3 --limit 4
 ```
 
 Then, for either driver:

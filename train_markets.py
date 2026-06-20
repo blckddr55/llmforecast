@@ -370,8 +370,8 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None,
                         help="cap the number of NEW markets forecast this run "
                         "(applied after de-duplicating against runs/)")
-    parser.add_argument("--trials", type=int, default=3,
-                        help="independent runs aggregated per market (default: 3)")
+    parser.add_argument("--trials", type=int, default=5,
+                        help="independent runs aggregated per market (default: 5)")
     parser.add_argument("--dry-run", action="store_true",
                         help="list the markets that would be forecast; make no LLM calls")
     parser.add_argument("--list-tags", action="store_true",
