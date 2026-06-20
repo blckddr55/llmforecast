@@ -193,6 +193,9 @@ uv run train_markets.py --tags politics,geopolitics --category politics --dry-ru
 # Forecast competitive binary markets (price within --min/--max-price), most
 # liquid first, capped per event and overall:
 uv run train_markets.py --tags politics,geopolitics --category politics --limit 10
+
+# Restrict to a liquidity band (both bounds optional, in USD):
+uv run train_markets.py --tags politics,geopolitics --min-liquidity 100000 --max-liquidity 500000
 ```
 
 Novelty markets are filtered out by default: events tagged `tweets-markets`

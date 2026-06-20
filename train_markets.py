@@ -106,6 +106,7 @@ def fetch_tag_markets(
     max_per_event: int = 5,
     exclude_tags: list[str] | None = None,
     exclude_pattern: str | None = None,
+    max_liquidity: float | None = None,
 ) -> list[dict]:
     """Fetch competitive binary markets from events carrying any of `tags`.
 
@@ -128,6 +129,8 @@ def fetch_tag_markets(
         "order": "liquidity",
         "ascending": "false",
     }
+    if max_liquidity is not None:
+        base["liquidity_max"] = max_liquidity
     excluded = set(exclude_tags or [])
     pattern = re.compile(exclude_pattern, re.IGNORECASE) if exclude_pattern else None
     events: dict = {}
@@ -301,6 +304,8 @@ def main() -> None:
                         help="markets resolving within this many days (default: 30)")
     parser.add_argument("--min-liquidity", type=float, default=50000,
                         help="minimum event liquidity in USD (default: 50000)")
+    parser.add_argument("--max-liquidity", type=float, default=None,
+                        help="maximum event liquidity in USD (default: no cap)")
     parser.add_argument("--min-price", type=float, default=0.05,
                         help="skip markets priced below this — near-decided (default: 0.05)")
     parser.add_argument("--max-price", type=float, default=0.95,
@@ -346,6 +351,7 @@ def main() -> None:
         args.min_price, args.max_price, args.max_per_event,
         exclude_tags=exclude_tags,
         exclude_pattern=args.exclude_pattern or None,
+        max_liquidity=args.max_liquidity,
     )
     found = len(tasks)
     tasks = dedupe_tasks(tasks)
