@@ -21,6 +21,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import forecaster
@@ -104,12 +105,15 @@ def fetch_tag_markets(
     max_price: float = 0.95,
     max_per_event: int = 5,
     exclude_tags: list[str] | None = None,
+    exclude_pattern: str | None = None,
 ) -> list[dict]:
     """Fetch competitive binary markets from events carrying any of `tags`.
 
     Events are fetched per tag (server-side) and de-duplicated. An event carrying
     any slug in `exclude_tags` is dropped (e.g. "tweets-markets" novelty markets).
-    Within each kept event we keep open binary Yes/No markets whose price is in
+    A market whose question (or its event title) matches the `exclude_pattern`
+    regex is dropped too (e.g. "publicly insult" novelty markets). Within each
+    kept event we keep open binary Yes/No markets whose price is in
     [min_price, max_price] (skipping near-decided ones), most-liquid first up to
     `max_per_event`. Returns forecasting tasks (see `make_task`); the caller
     de-duplicates against runs/ and applies any `--limit`.
@@ -125,6 +129,7 @@ def fetch_tag_markets(
         "ascending": "false",
     }
     excluded = set(exclude_tags or [])
+    pattern = re.compile(exclude_pattern, re.IGNORECASE) if exclude_pattern else None
     events: dict = {}
     for tag in tags:
         for e in polymarket.fetch_events_raw({**base, "tag_slug": tag}):
@@ -134,9 +139,12 @@ def fetch_tag_markets(
     for event in events.values():
         if excluded & _event_tag_slugs(event):
             continue
+        title = event.get("title") or ""
         eligible = []
         for market in event.get("markets") or []:
             if market.get("closed") or not _is_binary(market):
+                continue
+            if pattern and (pattern.search(market.get("question") or "") or pattern.search(title)):
                 continue
             price = _yes_price(market)
             if price is None or not (min_price <= price <= max_price):
@@ -302,6 +310,10 @@ def main() -> None:
     parser.add_argument("--exclude-tags", default="tweets-markets",
                         help="comma-separated tag slugs whose events to drop "
                         "(default: tweets-markets; pass '' to keep everything)")
+    parser.add_argument("--exclude-pattern", default="publicly insult",
+                        help="drop markets whose question/title matches this "
+                        "case-insensitive regex (default: 'publicly insult' novelty "
+                        "markets; pass '' to keep everything)")
     parser.add_argument("--limit", type=int, default=None,
                         help="cap the number of NEW markets forecast this run "
                         "(applied after de-duplicating against runs/)")
@@ -333,6 +345,7 @@ def main() -> None:
         tags, args.days, args.min_liquidity,
         args.min_price, args.max_price, args.max_per_event,
         exclude_tags=exclude_tags,
+        exclude_pattern=args.exclude_pattern or None,
     )
     found = len(tasks)
     tasks = dedupe_tasks(tasks)

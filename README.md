@@ -195,9 +195,11 @@ uv run train_markets.py --tags politics,geopolitics --category politics --dry-ru
 uv run train_markets.py --tags politics,geopolitics --category politics --limit 10
 ```
 
-Events tagged `tweets-markets` (novelty "how many tweets" markets) are dropped by
-default; control this with `--exclude-tags <slugs>` (pass `--exclude-tags ''` to
-keep everything).
+Novelty markets are filtered out by default: events tagged `tweets-markets`
+(`--exclude-tags <slugs>`) and markets whose question matches `publicly insult`
+(`--exclude-pattern <regex>`, a case-insensitive regex on the question/title).
+Pass `--exclude-tags ''` / `--exclude-pattern ''` to keep them, or extend the
+regex (e.g. `--exclude-pattern 'publicly insult|speak to'`) to drop more.
 
 **`train_worldcup.py`** — a sports preset that forecasts each upcoming match's
 binary "Will {team} win?" markets (match-winner markets resolve in *hours*, so
