@@ -204,6 +204,11 @@ Novelty markets are filtered out by default: events tagged `tweets-markets`
 Pass `--exclude-tags ''` / `--exclude-pattern ''` to keep them, or extend the
 regex (e.g. `--exclude-pattern 'publicly insult|speak to'`) to drop more.
 
+To discover tag slugs to pass to `--tags` / `--exclude-tags`, run
+`uv run train_markets.py --list-tags` — it prints every tag on active, liquid
+events with event counts (add `--tags politics` to see the tags that co-occur
+with a given one).
+
 **`train_worldcup.py`** — a sports preset that forecasts each upcoming match's
 binary "Will {team} win?" markets (match-winner markets resolve in *hours*, so
 they build a calibration set fast):

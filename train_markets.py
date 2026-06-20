@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 import forecaster
@@ -156,6 +157,53 @@ def fetch_tag_markets(
         eligible.sort(key=lambda m: _to_float(m.get("liquidityNum")), reverse=True)
         tasks.extend(make_task(event, m) for m in eligible[:max_per_event])
     return tasks
+
+
+def list_tags(
+    tags: list[str],
+    within_days: int,
+    min_liquidity: float,
+    max_liquidity: float | None = None,
+) -> None:
+    """Print the tags present on matching events, with event counts.
+
+    With no `tags`, lists every tag across active, liquid events in the window —
+    the universe of slugs you can pass to --tags / --exclude-tags. With `tags`
+    given, lists the tags that co-occur with those (useful for finding slugs to
+    exclude). Discovery only: price/exclude filters are not applied.
+    """
+    now = datetime.now(timezone.utc)
+    base = {
+        "active": "true",
+        "closed": "false",
+        "end_date_min": _iso(now),
+        "end_date_max": _iso(now + timedelta(days=within_days)),
+        "liquidity_min": min_liquidity,
+        "order": "liquidity",
+        "ascending": "false",
+    }
+    if max_liquidity is not None:
+        base["liquidity_max"] = max_liquidity
+
+    events: dict = {}
+    queries = [{**base, "tag_slug": t} for t in tags] if tags else [base]
+    for params in queries:
+        for e in polymarket.fetch_events_raw(params):
+            events.setdefault(e.get("id"), e)
+
+    counts: Counter = Counter()
+    labels: dict = {}
+    for e in events.values():
+        for t in e.get("tags") or []:
+            slug = t.get("slug")
+            if slug:
+                counts[slug] += 1
+                labels[slug] = t.get("label") or ""
+    scope = f"co-occurring with {tags}" if tags else "across active, liquid events"
+    print(f"{len(counts)} tag(s) {scope} ({len(events)} event(s)):")
+    print(f"  {'events':>6}  {'slug':<34} label")
+    for slug, n in counts.most_common():
+        print(f"  {n:>6}  {slug:<34} {labels.get(slug, '')}")
 
 
 def forecast_tasks(tasks: list[dict], trials: int, category: str) -> list:
@@ -326,6 +374,9 @@ def main() -> None:
                         help="independent runs aggregated per market (default: 3)")
     parser.add_argument("--dry-run", action="store_true",
                         help="list the markets that would be forecast; make no LLM calls")
+    parser.add_argument("--list-tags", action="store_true",
+                        help="list the tags on matching events (with counts), then exit; "
+                        "works with or without --tags")
     parser.add_argument("--resolve", action="store_true",
                         help="auto-resolve pending Polymarket runs from Gamma, then exit")
     args = parser.parse_args()
@@ -341,6 +392,9 @@ def main() -> None:
         return
 
     tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+    if args.list_tags:
+        list_tags(tags, args.days, args.min_liquidity, args.max_liquidity)
+        return
     if not tags:
         parser.error("--tags is required (e.g. --tags politics,geopolitics)")
     category = args.category or tags[0]
