@@ -207,7 +207,11 @@ def list_tags(
 
 
 def forecast_tasks(tasks: list[dict], trials: int, category: str) -> list:
-    """Forecast each task independently and save a run per market."""
+    """Forecast each task independently and save a run per market.
+
+    A market that fails outright (e.g. a sustained API outage) is logged and
+    skipped so the rest of the batch still runs — already-saved runs are kept.
+    """
     saved = []
     for i, task in enumerate(tasks, start=1):
         mp = task["market_price"]
@@ -216,20 +220,24 @@ def forecast_tasks(tasks: list[dict], trials: int, category: str) -> list:
             i, len(tasks), task["question"],
             f"{mp:.0%}" if mp is not None else "n/a",
         )
-        result = forecaster.aggregate_forecasts(
-            task["question"],
-            prior=None,  # independent: the agent forms its own view
-            num_trials=trials,
-            category=category,
-            background=task["background"],
-            resolution_criteria=task["resolution_criteria"],
-        )
-        path = forecaster.save_run(
-            task["question"], result,
-            prior=None, num_trials=trials,
-            background=task["background"], resolution_criteria=task["resolution_criteria"],
-            extra={"market": task["market"], "market_price": mp},
-        )
+        try:
+            result = forecaster.aggregate_forecasts(
+                task["question"],
+                prior=None,  # independent: the agent forms its own view
+                num_trials=trials,
+                category=category,
+                background=task["background"],
+                resolution_criteria=task["resolution_criteria"],
+            )
+            path = forecaster.save_run(
+                task["question"], result,
+                prior=None, num_trials=trials,
+                background=task["background"], resolution_criteria=task["resolution_criteria"],
+                extra={"market": task["market"], "market_price": mp},
+            )
+        except Exception as exc:
+            logger.warning("  market failed, skipping: %s", exc)
+            continue
         saved.append(path)
         logger.info(
             "  -> agent p=%.3f vs market %s | saved %s",
@@ -237,6 +245,7 @@ def forecast_tasks(tasks: list[dict], trials: int, category: str) -> list:
             f"{mp:.3f}" if mp is not None else "n/a",
             path.name,
         )
+    logger.info("Forecast %d/%d market(s) successfully.", len(saved), len(tasks))
     return saved
 
 

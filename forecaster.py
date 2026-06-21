@@ -449,7 +449,7 @@ def summarize(
     criteria = (resolution_criteria or "").strip() or "(not separately specified)"
     combined = "\n\n---\n\n".join(docs)[:SUMMARIZER_MAX_DOC_CHARS]
     try:
-        response = get_genai_client().models.generate_content(
+        response = _generate(
             model=SUMMARIZER_MODEL,
             contents=f"Specifically: {instruction}\n\nSearch results:\n\n{combined}",
             config=types.GenerateContentConfig(
@@ -502,6 +502,28 @@ def _add_usage(acc: dict, response) -> None:
     acc["output"] += getattr(um, "candidates_token_count", 0) or 0
     acc["thinking"] += getattr(um, "thoughts_token_count", 0) or 0
     acc["total"] += getattr(um, "total_token_count", 0) or 0
+
+
+def _generate(*, model, contents, config, attempts: int = 4):
+    """generate_content with retries + backoff on transient failures.
+
+    A dropped connection or 5xx (e.g. httpx.RemoteProtocolError) shouldn't kill a
+    long run, so we retry a few times with exponential backoff before giving up.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return get_genai_client().models.generate_content(
+                model=model, contents=contents, config=config
+            )
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            wait = 2 ** attempt  # 2, 4, 8 seconds
+            logger.warning(
+                "Gemini call failed (attempt %d/%d): %s — retrying in %ds",
+                attempt, attempts, type(exc).__name__, wait,
+            )
+            time.sleep(wait)
 
 
 def run_read_files(
@@ -563,7 +585,6 @@ def run_agent(
     if prior is not None and not 0.0 <= prior <= 1.0:
         raise ValueError(f"prior must be a probability in [0, 1], got {prior!r}")
 
-    client = get_genai_client()
     today = datetime.now().strftime("%Y-%m-%d (%A)")
     config = types.GenerateContentConfig(
         system_instruction=(
@@ -622,9 +643,7 @@ def run_agent(
 
     try:
         for step in range(1, max_steps + 1):
-            response = client.models.generate_content(
-                model=MODEL, contents=contents, config=config
-            )
+            response = _generate(model=MODEL, contents=contents, config=config)
             _add_usage(usage, response)
 
             calls = response.function_calls or []
@@ -790,15 +809,19 @@ def summarize_forecast(
         "anywhere in the briefing, even if the per-trial notes above reference them. "
         "Build the case for and against from substantive evidence only."
     )
-    response = get_genai_client().models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.3,
-            max_output_tokens=2048,
-            thinking_config=types.ThinkingConfig(thinking_level="low"),
-        ),
-    )
+    try:
+        response = _generate(
+            model=MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=2048,
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+            ),
+        )
+    except Exception as exc:  # a briefing failure must not lose the forecast
+        logger.warning("briefing synthesis failed: %s", exc)
+        return f"(briefing unavailable: {exc})"
     if usage is not None:
         _add_usage(usage, response)
     return (response.text or "").strip()
@@ -850,12 +873,16 @@ def aggregate_forecasts(
     for trial in range(1, num_trials + 1):
         logger.info("=== Trial %d/%d ===", trial, num_trials)
         trial_start = time.perf_counter()
-        belief = run_agent(
-            question,
-            prior=prior,
-            background=background,
-            resolution_criteria=resolution_criteria,
-        )
+        try:
+            belief = run_agent(
+                question,
+                prior=prior,
+                background=background,
+                resolution_criteria=resolution_criteria,
+            )
+        except Exception as exc:  # one bad trial shouldn't lose the others
+            logger.warning("Trial %d/%d failed, skipping: %s", trial, num_trials, exc)
+            continue
         beliefs.append(belief)
         for key in total_usage:
             total_usage[key] += belief.get("usage", {}).get(key, 0)
@@ -868,6 +895,8 @@ def aggregate_forecasts(
             belief.get("usage", {}).get("total", 0),
         )
 
+    if not beliefs:
+        raise RuntimeError(f"all {num_trials} trials failed for {question!r}")
     probabilities = [float(b["probability"]) for b in beliefs]
     aggregated = float(expit(np.mean(logit(np.asarray(probabilities)))))
 
