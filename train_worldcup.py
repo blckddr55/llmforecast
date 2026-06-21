@@ -107,6 +107,9 @@ def main() -> None:
                         help="cap the number of matches forecast")
     parser.add_argument("--trials", type=int, default=5,
                         help="independent runs aggregated per market (default: 5)")
+    parser.add_argument("--use-market-prior", action=argparse.BooleanOptionalAction, default=True,
+                        help="inject each market's price as the prior anchor (default: on; "
+                        "pass --no-use-market-prior to forecast independently)")
     parser.add_argument("--category", default="world-cup",
                         help="calibration category recorded on each run (default: world-cup)")
     parser.add_argument("--include-draws", action="store_true",
@@ -147,7 +150,7 @@ def main() -> None:
     if missing:
         raise SystemExit(f"Missing required environment variable(s): {', '.join(missing)}")
 
-    forecast_tasks(tasks, args.trials, args.category)
+    forecast_tasks(tasks, args.trials, args.category, use_market_prior=args.use_market_prior)
     logger.info("Done. Resolve later with: uv run train_worldcup.py --resolve")
 
 

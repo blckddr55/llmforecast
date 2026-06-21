@@ -179,9 +179,12 @@ A category unseen at fit time falls back to the global fit (offset 0).
 
 Calibration needs *resolved* forecasts, and most questions take months to settle.
 Two drivers forecast Polymarket markets to build a calibration set, then
-auto-resolve them from Polymarket once they settle. Both forecast each market
-**independently** (no market prior — markets are ignored as evidence) and save a
-run per market tagged with a `--category`.
+auto-resolve them from Polymarket once they settle. By default each market's
+price is injected as the **prior anchor** (the crowd signal): the model starts
+from it and updates away only as evidence justifies. Pass `--no-use-market-prior`
+to forecast **independently** instead (the agent forms its own base rate; markets
+are ignored as evidence). Either way a run is saved per market, tagged
+`--category`.
 
 **`train_markets.py`** — general, selects markets by Polymarket **tag**. Pool
 several tags into one calibration category (e.g. politics + geopolitics):
@@ -228,8 +231,8 @@ uv run forecaster.py --calibrate
 ```
 
 Each run stores a `market` reference (event slug + condition id) and the
-`market_price` (recorded only for comparison — **not** used as a prior), so
-`--resolve` maps it back to the settled outcome. Cost scales as markets ×
+`market_price` (and, when anchoring is on, that same value as the run's `prior`),
+so `--resolve` maps it back to the settled outcome. Cost scales as markets ×
 `--trials`, so start with `--dry-run` and a small `--limit`. Pooling tags under
 one `--category` calibrates them together (their own bias offset in the shared
 hierarchical fit); see [Calibration](#calibration).

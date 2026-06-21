@@ -206,24 +206,31 @@ def list_tags(
         print(f"  {n:>6}  {slug:<34} {labels.get(slug, '')}")
 
 
-def forecast_tasks(tasks: list[dict], trials: int, category: str) -> list:
-    """Forecast each task independently and save a run per market.
+def forecast_tasks(
+    tasks: list[dict], trials: int, category: str, use_market_prior: bool = True
+) -> list:
+    """Forecast each task and save a run per market.
 
+    When `use_market_prior` is set (the default), each market's price is injected
+    as the prior anchor (the crowd signal) — the model starts from it and updates
+    away only as evidence justifies. Otherwise the agent forecasts independently.
     A market that fails outright (e.g. a sustained API outage) is logged and
     skipped so the rest of the batch still runs — already-saved runs are kept.
     """
     saved = []
     for i, task in enumerate(tasks, start=1):
         mp = task["market_price"]
+        prior = mp if (use_market_prior and mp is not None) else None
         logger.info(
-            "[%d/%d] %s (market %s)",
+            "[%d/%d] %s (market %s%s)",
             i, len(tasks), task["question"],
             f"{mp:.0%}" if mp is not None else "n/a",
+            ", anchored" if prior is not None else "",
         )
         try:
             result = forecaster.aggregate_forecasts(
                 task["question"],
-                prior=None,  # independent: the agent forms its own view
+                prior=prior,
                 num_trials=trials,
                 category=category,
                 background=task["background"],
@@ -231,7 +238,7 @@ def forecast_tasks(tasks: list[dict], trials: int, category: str) -> list:
             )
             path = forecaster.save_run(
                 task["question"], result,
-                prior=None, num_trials=trials,
+                prior=prior, num_trials=trials,
                 background=task["background"], resolution_criteria=task["resolution_criteria"],
                 extra={"market": task["market"], "market_price": mp},
             )
@@ -381,6 +388,10 @@ def main() -> None:
                         "(applied after de-duplicating against runs/)")
     parser.add_argument("--trials", type=int, default=5,
                         help="independent runs aggregated per market (default: 5)")
+    parser.add_argument("--use-market-prior", action=argparse.BooleanOptionalAction, default=True,
+                        help="inject each market's price as the prior anchor — the model "
+                        "starts from it and updates on evidence (default: on; pass "
+                        "--no-use-market-prior to forecast independently)")
     parser.add_argument("--dry-run", action="store_true",
                         help="list the markets that would be forecast; make no LLM calls")
     parser.add_argument("--list-tags", action="store_true",
@@ -435,7 +446,7 @@ def main() -> None:
     if missing:
         raise SystemExit(f"Missing required environment variable(s): {', '.join(missing)}")
 
-    forecast_tasks(tasks, args.trials, category)
+    forecast_tasks(tasks, args.trials, category, use_market_prior=args.use_market_prior)
     logger.info("Done. Resolve later with: uv run train_markets.py --resolve")
 
 
