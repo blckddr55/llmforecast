@@ -69,7 +69,11 @@ CALIBRATION_PATH = Path(__file__).resolve().parent / "calibration_fit.json"
 # provider layer below (see Provider / --provider); the knobs here are shared
 # across providers.
 
-MAX_STEPS = 14  # max agent steps per run before forcing a submission (read_files adds round-trips)
+MAX_STEPS = 24  # max agent steps per run before forcing a submission (read_files adds
+#               # round-trips). Raised now that the cheap DeepSeek tier makes deeper
+#               # hunting affordable; CHAMPS KNOW rewards more searches + incremental
+#               # updates. Note: on Gemini the per-step context grows, so cost climbs
+#               # with the budget — the headroom mostly benefits the cheaper backend.
 NUM_TRIALS = 5  # independent runs aggregated per question
 MAX_OUTPUT_TOKENS = 8192  # headroom for high-effort thinking + the structured function call
 TEMPERATURE = 1.0  # >0 so the NUM_TRIALS runs genuinely diverge
@@ -122,7 +126,29 @@ UPDATE_BELIEF_FUNCTION = types.FunctionDeclaration(
                 maximum=0.95,
                 description=(
                     "Your current posterior probability that the claim is true / "
-                    "the event occurs, as a calibrated float between 0.05 and 0.95."
+                    "the event occurs, as a calibrated float between 0.05 and 0.95. "
+                    "Be precise (e.g. 0.78, not 'likely')."
+                ),
+            ),
+            "comparison_class": types.Schema(
+                type="STRING",
+                description=(
+                    "Outside view (CHAMPS KNOW: Comparison classes / Outside view): "
+                    "the reference class of similar past cases your base rate is "
+                    "drawn from, e.g. 'first-term incumbents facing a recession'. "
+                    "Set it at step 1 and carry it forward (refine only if you find "
+                    "a better reference class)."
+                ),
+            ),
+            "base_rate": types.Schema(
+                type="NUMBER",
+                minimum=0.05,
+                maximum=0.95,
+                description=(
+                    "The outside-view base rate: the share of your comparison_class "
+                    "that resolved YES, BEFORE case-specific evidence. This is your "
+                    "anchor; the posterior should only move away from it as far as "
+                    "the evidence justifies."
                 ),
             ),
             "confidence": types.Schema(
@@ -162,8 +188,9 @@ UPDATE_BELIEF_FUNCTION = types.FunctionDeclaration(
                 description=(
                     "If action is 'web_search', a focused search query. If action is "
                     "'read_files', the instruction for the summarizer — the specific "
-                    "facts to extract from the chosen files. If action is 'submit', a "
-                    "brief justification of the final probability."
+                    "facts to extract from the chosen files. If action is 'submit', "
+                    "your pre-mortem (the strongest case your forecast is WRONG) plus "
+                    "a brief justification of the final probability."
                 ),
             ),
             "read_file_ids": types.Schema(
@@ -179,6 +206,8 @@ UPDATE_BELIEF_FUNCTION = types.FunctionDeclaration(
         },
         required=[
             "probability",
+            "comparison_class",
+            "base_rate",
             "confidence",
             "evidence_for",
             "evidence_against",
@@ -200,22 +229,48 @@ NO_MARKETS_RULE = (
 )
 
 SYSTEM_PROMPT = (
-    "You are an expert superforecaster. Your task is to predict the probability "
-    "that a binary question will resolve YES, based on the evidence you gather.\n\n"
-    "You work in a tool-use loop:\n"
-    "1. Read the question, its resolution criteria, and background.\n"
-    "2. Form a base rate estimate (outside view / reference-class reasoning).\n"
-    "3. Then loop: at each step call `update_belief_and_act` to record your "
+    "You are an elite superforecaster. Predict the probability that a binary "
+    "question resolves YES, working with the CHAMPS KNOW discipline from Philip "
+    "Tetlock's research on what makes forecasters accurate.\n\n"
+    "METHOD — CHAMPS KNOW:\n"
+    "- Comparison classes & Outside view (C, O): START from the outside. Identify "
+    "a reference class of similar past cases and the rate at which they resolved "
+    "YES, BEFORE weighing case-specific detail. Record these as `comparison_class` "
+    "and `base_rate`, and treat the base rate as the anchor you adjust away from.\n"
+    "- Hunt for information (H): actively dig for primary, hard-to-find evidence — "
+    "official data, original documents, domain-specific facts — not punditry or "
+    "commentary. Go past the obvious sources.\n"
+    "- Adjust often (A): update incrementally and frequently. Make many small, "
+    "evidence-proportioned Bayesian updates rather than a few big jumps; a large "
+    "swing demands correspondingly strong, corroborated evidence.\n"
+    "- Make precise estimates (M): commit to a specific number (e.g. 0.78), never "
+    "vague language. Granularity carries information.\n"
+    "- Pre-mortem / Post-mortem (P): before submitting, run a pre-mortem — state "
+    "the strongest case that your forecast is WRONG and confirm your probability "
+    "already prices it in.\n"
+    "- Synthesize (S): combine multiple independent perspectives and source types "
+    "into one balanced estimate; don't anchor on a single narrative.\n"
+    "- No sacred cows (N): set aside ideology, hopes, and prior commitments — "
+    "follow only the evidence, even when it cuts against what you'd like to be "
+    "true.\n"
+    "Your forecast is one of several independent runs that are aggregated and "
+    "scored over time by Brier score (Keep score, Wisdom of crowds) — so be "
+    "calibrated, not dramatic.\n\n"
+    "LOOP:\n"
+    "1. Form your `comparison_class` and `base_rate` (the outside view).\n"
+    "2. Then loop: at each step call `update_belief_and_act` to record your "
     "current belief state and choose ONE action. After each action your belief "
     "state is updated with what you learned.\n"
-    "4. When you have gathered enough evidence, submit (action='submit') with your "
-    "final probability and reasoning.\n\n"
-    "Belief state rules:\n"
+    "3. Submit (action='submit') once the estimate has stabilized, further "
+    "evidence is unlikely to move it, AND you have run the pre-mortem.\n\n"
+    "Belief-state rules:\n"
+    "- Carry `comparison_class` and `base_rate` forward on every step (refine the "
+    "base rate only if you find a better reference class).\n"
     "- Evidence lists (evidence_for / evidence_against) must ACCUMULATE across "
     "steps: carry forward what still holds and add to it — do not start fresh.\n"
     "- Each evidence item MUST cite its source by file id (e.g. search_1_result_3).\n"
     "- In update_reasoning, explain WHY the latest evidence changed your "
-    "probability (the Bayesian update you just performed).\n"
+    "probability and by roughly how much (the Bayesian update you just performed).\n"
     "- Weigh the RECENCY and AUTHORITATIVENESS of each source.\n\n"
     f"{NO_MARKETS_RULE}\n\n"
     "Actions (set `action` on update_belief_and_act):\n"
@@ -226,12 +281,13 @@ SYSTEM_PROMPT = (
     "and a specific extraction instruction in action_input. Their text is "
     "summarized and returned. Read before trusting a snippet when a result looks "
     "decisive.\n"
-    "- 'submit': finalize — put a brief justification of your probability in "
+    "- 'submit': finalize — put your pre-mortem and a brief justification in "
     "action_input.\n\n"
     "Rules:\n"
     f"- You MUST submit before step {MAX_STEPS}.\n"
-    "- Submit once your probability has stabilized and further evidence is "
-    "unlikely to change it.\n"
+    "- Keep hunting and adjusting until the estimate stabilizes; on a genuinely "
+    "uncertain question, do NOT submit after a shallow look — gather more "
+    "evidence first.\n"
     "- Probabilities must be between 0.05 and 0.95; reserve the extremes for "
     "claims backed by strong, corroborated evidence."
 )
@@ -241,14 +297,16 @@ SYSTEM_PROMPT = (
 JSON_OUTPUT_INSTRUCTION = (
     "\n\nOUTPUT FORMAT — at every step respond with a SINGLE JSON object and "
     "NOTHING else (no prose, no markdown fences), with exactly these keys:\n"
-    '  "probability": number between 0.05 and 0.95,\n'
+    '  "probability": number between 0.05 and 0.95 (be precise, e.g. 0.78),\n'
+    '  "comparison_class": string — the reference class for your base rate,\n'
+    '  "base_rate": number 0.05–0.95 — the outside-view base rate (your anchor),\n'
     '  "confidence": one of "low", "medium", "high",\n'
     '  "evidence_for": array of strings (each citing a file id),\n'
     '  "evidence_against": array of strings (each citing a file id),\n'
     '  "update_reasoning": string — the Bayesian update you just made,\n'
     '  "action": one of "web_search", "read_files", "submit",\n'
     '  "action_input": string — the search query, extraction instruction, or '
-    "final justification,\n"
+    "(for submit) your pre-mortem plus final justification,\n"
     '  "read_file_ids": array of strings — only when action is "read_files".\n'
     "Return only the JSON object."
 )
@@ -282,18 +340,21 @@ def build_initial_message(
         parts.append(
             "## Prior estimate\n"
             f"An external prior estimate for this question is {prior:.0%} (a "
-            "market-implied probability or a historical base rate). Use this as "
-            "your starting point, but adjust based on question-specific evidence "
-            "from search and tools."
+            "market-implied probability or a historical base rate — the wisdom of "
+            "the crowd). Use it to inform your `base_rate`, then adjust on "
+            "question-specific evidence from search and tools."
         )
     else:
         parts.append(
             "## Prior estimate\n"
-            "No prior is given. Establish your own base rate from reference-class "
-            "reasoning before gathering evidence."
+            "No prior is given. Build your own `base_rate` from a comparison class "
+            "of similar past cases (the outside view) before gathering evidence."
         )
 
-    parts.append("Begin by forming your base rate, then call update_belief_and_act.")
+    parts.append(
+        "Begin with the outside view: state your comparison_class and base_rate, "
+        "then call update_belief_and_act."
+    )
     return "\n\n".join(parts)
 
 # --- Providers (pluggable LLM backends) --------------------------------------
@@ -981,10 +1042,15 @@ def run_agent(
             belief["probability"] = probability  # store the clamped value
             action = belief.get("action", "submit")
 
+            try:
+                base_str = f"{float(belief['base_rate']):.2f}"
+            except (KeyError, TypeError, ValueError):
+                base_str = "?"
             logger.info(
-                "step %2d/%d | p=%.3f | confidence=%s | action=%s",
+                "step %2d/%d | base=%s p=%.3f | confidence=%s | action=%s",
                 step,
                 max_steps,
+                base_str,
                 probability,
                 belief.get("confidence", "?"),
                 action,
@@ -999,6 +1065,8 @@ def run_agent(
                 {
                     "step": step,
                     "probability": probability,
+                    "base_rate": belief.get("base_rate"),
+                    "comparison_class": belief.get("comparison_class"),
                     "confidence": belief.get("confidence"),
                     "action": action,
                     "action_input": belief.get("action_input"),

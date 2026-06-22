@@ -19,21 +19,37 @@ The agent loop is provider-agnostic; each backend just implements the structured
 
 ## How it works
 
+The agent follows the **CHAMPS KNOW** discipline from Philip Tetlock's research on
+superforecasting. Each principle is operationalized in the loop:
+
+| Principle | How it shows up |
+| --- | --- |
+| **C**omparison classes / **O**utside view | The agent must name a `comparison_class` and a `base_rate` and anchor on it before weighing case-specific detail |
+| **H**unt for information | Brave search + `read_files`, prompted to dig for primary data over punditry; a higher step budget rewards deeper hunting |
+| **A**djust often | Many small, evidence-proportioned Bayesian updates per step rather than big jumps |
+| **M**ake precise estimates | A numeric `probability` (e.g. `0.78`), never vague language |
+| **P**ost-mortem / pre-mortem | A pre-mortem (strongest case the forecast is wrong) is required before `submit` |
+| **S**ynthesize | The final briefing fuses the independent trials into one balanced view |
+| **N**o sacred cows | The prompt instructs the model to set aside ideology and follow only the evidence |
+| **K**eep score | Resolved runs are scored by **Brier** / log loss in `calibration.py` |
+| **W**isdom of crowds | `NUM_TRIALS` independent runs are aggregated; an optional market **prior** anchors on the crowd |
+
 At every step the model records a single structured object,
 `update_belief_and_act` (a forced function call on Gemini, constrained JSON on
 DeepSeek), which contains:
 
 - `probability` — the current posterior, calibrated to `[0.05, 0.95]`
+- `comparison_class` / `base_rate` — the outside-view reference class and its base rate (the anchor)
 - `confidence` — `low` / `medium` / `high`
 - `evidence_for` / `evidence_against` — concrete supporting / contradicting evidence
 - `update_reasoning` — the Bayesian update just performed
 - `action` — `web_search`, `read_files`, or `submit`
-- `action_input` — a search query, an extraction instruction, or a final justification
+- `action_input` — a search query, an extraction instruction, or (at submit) the pre-mortem + justification
 
 When the action is `web_search`, the agent runs a Brave search and feeds the
 results back; `read_files` pulls chosen results in full through a cheaper
 summarizer (progressive disclosure). It updates again each step — up to
-`MAX_STEPS` (14). When it `submit`s (or the step budget runs out), the run
+`MAX_STEPS` (24). When it `submit`s (or the step budget runs out), the run
 returns its final probability.
 Prediction-market and betting sites are excluded from the search, and the model
 is told not to treat their odds as evidence — so the forecast rests on primary
@@ -267,7 +283,7 @@ The shared knobs live at the top of `forecaster.py`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `MAX_STEPS` | `14` | Max agent steps per run |
+| `MAX_STEPS` | `24` | Max agent steps per run (raised for deeper hunting on the cheap backend) |
 | `NUM_TRIALS` | `5` | Independent runs aggregated per question |
 | `MAX_OUTPUT_TOKENS` | `8192` | Output token cap per call (headroom for thinking) |
 | `TEMPERATURE` | `1.0` | Sampling temperature (so trials diverge) |
