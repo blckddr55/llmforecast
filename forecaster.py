@@ -1,21 +1,29 @@
-"""Bayesian Linguistic Forecaster (Google Gemini + Brave Search).
+"""Bayesian Linguistic Forecaster (pluggable LLM + Brave Search).
 
 An agent that estimates the probability of a forecasting question by reasoning
 like a superforecaster: it starts from a base rate and performs explicit Bayesian
-updates as it gathers web evidence via Brave Search. At every step the model is forced
-to call a single function (`update_belief_and_act`) that records its current
-posterior probability, the supporting/contradicting evidence, and the next
-action (search again, or submit).
+updates as it gathers web evidence via Brave Search. At every step the model
+records its current posterior probability, the supporting/contradicting evidence,
+and the next action (search again, read files, or submit) as a single structured
+object (`update_belief_and_act`).
+
+The LLM backend is pluggable (see --provider) so cost and quality can be compared
+head-to-head: `gemini` uses Google's google-genai SDK with forced function
+calling; `deepseek` uses DeepSeek's OpenAI-compatible API with JSON structured
+output (DeepSeek V4 rejects forced tool_choice, so we constrain the output shape
+instead). The agent loop is provider-agnostic.
 
 To reduce variance, each question is forecast with several independent agent
 runs, and the resulting probabilities are combined with a logit-space mean
 (averaging in log-odds space rather than probability space).
 
-API keys are loaded from a local .env file (git-ignored) and must include:
-    GEMINI_API_KEY
-    BRAVE_API_KEY
+API keys are loaded from a local .env file (git-ignored) and must include
+BRAVE_API_KEY plus the key for the selected provider:
+    GEMINI_API_KEY    (--provider gemini, the default)
+    DEEPSEEK_API_KEY  (--provider deepseek)
 
 Run with:  uv run forecaster.py
+DeepSeek:  uv run forecaster.py --provider deepseek "<question>"
 Verbose:   LOG_LEVEL=DEBUG uv run forecaster.py   (adds the full evidence lists)
 """
 
@@ -56,8 +64,10 @@ RUNS_DIR = Path(__file__).resolve().parent / "runs"
 CALIBRATION_PATH = Path(__file__).resolve().parent / "calibration_fit.json"
 
 # --- Configuration -----------------------------------------------------------
-
-MODEL = "gemini-3.5-flash"  # latest GA Gemini generation (newer than any 3.x Pro preview)
+#
+# The LLM backend (model names + thinking level) is selected at runtime via the
+# provider layer below (see Provider / --provider); the knobs here are shared
+# across providers.
 
 MAX_STEPS = 14  # max agent steps per run before forcing a submission (read_files adds round-trips)
 NUM_TRIALS = 5  # independent runs aggregated per question
@@ -67,9 +77,9 @@ BRAVE_MAX_RESULTS = 10  # snippets shown per search (full text goes to files, no
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
 # Progressive disclosure: search results are written to local files; the agent
-# reads chosen ones through a cheaper sub-LLM summarizer (Gemini Flash) so the
-# main context only ever sees short snippets plus the summaries it requested.
-SUMMARIZER_MODEL = MODEL  # the sub-LLM that summarizes read files
+# reads chosen ones through a cheaper sub-LLM summarizer (each provider's cheap
+# tier) so the main context only ever sees short snippets plus the summaries it
+# requested. The summarizer model is per-provider (see Provider.summarizer_model).
 SUMMARIZER_MAX_TOKENS = 1536  # output cap for a file summary
 SUMMARIZER_MAX_DOC_CHARS = 20000  # cap on concatenated file text sent to the summarizer
 
@@ -90,12 +100,6 @@ EXCLUDE_DOMAINS = [
     "smarkets.com",
     "pinnacle.com",
 ]
-
-# Gemini 3 "thinking level" applied to each forced function call. "high"
-# maximizes reasoning depth; use "low" for cheaper, faster runs. On
-# gemini-3.5-flash this stays modest (a few hundred thinking tokens); give
-# MAX_OUTPUT_TOKENS more headroom if you switch to a heavier model.
-THINKING_LEVEL = "high"
 
 TOOL_NAME = "update_belief_and_act"
 
@@ -232,6 +236,24 @@ SYSTEM_PROMPT = (
     "claims backed by strong, corroborated evidence."
 )
 
+# Appended to the system prompt for providers that express update_belief_and_act
+# as constrained JSON output (rather than a forced tool call) — see DeepSeekSession.
+JSON_OUTPUT_INSTRUCTION = (
+    "\n\nOUTPUT FORMAT — at every step respond with a SINGLE JSON object and "
+    "NOTHING else (no prose, no markdown fences), with exactly these keys:\n"
+    '  "probability": number between 0.05 and 0.95,\n'
+    '  "confidence": one of "low", "medium", "high",\n'
+    '  "evidence_for": array of strings (each citing a file id),\n'
+    '  "evidence_against": array of strings (each citing a file id),\n'
+    '  "update_reasoning": string — the Bayesian update you just made,\n'
+    '  "action": one of "web_search", "read_files", "submit",\n'
+    '  "action_input": string — the search query, extraction instruction, or '
+    "final justification,\n"
+    '  "read_file_ids": array of strings — only when action is "read_files".\n'
+    "Return only the JSON object."
+)
+
+
 def build_initial_message(
     question: str,
     prior: float | None = None,
@@ -274,21 +296,366 @@ def build_initial_message(
     parts.append("Begin by forming your base rate, then call update_belief_and_act.")
     return "\n\n".join(parts)
 
-# --- Clients (lazily constructed so the module is import-safe) ---------------
+# --- Providers (pluggable LLM backends) --------------------------------------
+#
+# The agent needs two operations from a backend: a structured "belief" step (the
+# arguments to update_belief_and_act) within a multi-turn Session, and a one-shot
+# plain-text completion (file summaries + the final briefing). Each Provider
+# implements both; the agent loop never touches an SDK directly, so adding a
+# backend means adding a Provider, not editing the loop.
 
-_genai_client: genai.Client | None = None
+# Token pricing (USD per 1M tokens) as (input, output). Thinking/reasoning tokens
+# bill as output; cache-hit discounts are ignored (prompts rarely repeat). Used
+# only to estimate run cost — keep roughly in step with each provider's pricing.
+PRICING_PER_MTOK = {
+    "gemini-3.5-flash": (1.50, 9.00),
+    "deepseek-v4-pro": (0.435, 0.87),    # launch promo (~75% off); list ~ 1.74 / 3.48
+    "deepseek-v4-flash": (0.14, 0.28),
+}
+
+
+def _new_usage() -> dict:
+    return {"prompt": 0, "output": 0, "thinking": 0, "total": 0}
+
+
+def _merge_usage(acc: dict, delta: dict) -> None:
+    """Add one call's normalized usage delta into an accumulator."""
+    for key in acc:
+        acc[key] += delta.get(key, 0) or 0
+
+
+def cost_usd(usage: dict | None, model: str) -> float | None:
+    """Estimate the USD cost of `usage` tokens billed at `model`'s rate.
+
+    Thinking/reasoning tokens bill as output. Returns None for an unpriced model.
+    Note: across a run, summarizer/briefing calls use the provider's cheaper
+    `summarizer_model`, so charging everything at the main model's rate is a
+    (usually slight) upper bound.
+    """
+    rates = PRICING_PER_MTOK.get(model)
+    if rates is None or not usage:
+        return None
+    in_rate, out_rate = rates
+    billed_output = (usage.get("output", 0) or 0) + (usage.get("thinking", 0) or 0)
+    return ((usage.get("prompt", 0) or 0) * in_rate + billed_output * out_rate) / 1_000_000
+
+
+def _retry(call, *, attempts: int = 4, label: str = "LLM"):
+    """Call `call()` with exponential backoff on transient failures.
+
+    A dropped connection or 5xx (e.g. httpx.RemoteProtocolError) shouldn't kill a
+    long run, so we retry a few times before giving up.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt == attempts:
+                raise
+            wait = 2 ** attempt  # 2, 4, 8 seconds
+            logger.warning(
+                "%s call failed (attempt %d/%d): %s — retrying in %ds",
+                label, attempt, attempts, type(exc).__name__, wait,
+            )
+            time.sleep(wait)
+
+
+class Session:
+    """A live, multi-turn forecasting conversation with a backend.
+
+    `add_user` appends a user turn; `step` advances one model turn and returns the
+    parsed belief (the update_belief_and_act arguments, or None if the model
+    returned no structured output) plus that turn's normalized token usage,
+    recording the model's turn internally; `add_tool_result` feeds back a search
+    or read result. Implementations own the provider-native message format.
+    """
+
+    def add_user(self, text: str) -> None:
+        raise NotImplementedError
+
+    def step(self) -> tuple[dict | None, dict]:
+        raise NotImplementedError
+
+    def add_tool_result(self, text: str) -> None:
+        raise NotImplementedError
+
+
+class Provider:
+    """A pluggable LLM backend. Subclasses set the model/key attributes and
+    implement `new_session` (the agent loop) and `complete` (one-shot text)."""
+
+    name: str
+    model: str             # main reasoning model (the agent loop)
+    summarizer_model: str  # cheaper model for file summaries + the final briefing
+    thinking_level: str    # recorded on saved runs; meaning is provider-specific
+    env_var: str
+
+    def require_key(self) -> None:
+        if not os.environ.get(self.env_var):
+            raise RuntimeError(f"{self.env_var} is not set (expected in {ENV_PATH}).")
+
+    def new_session(
+        self, *, system_instruction: str, temperature: float, max_output_tokens: int
+    ) -> Session:
+        raise NotImplementedError
+
+    def complete(
+        self, *, model: str, system: str | None, prompt: str,
+        temperature: float, max_output_tokens: int, thinking_level: str = "low",
+    ) -> tuple[str, dict]:
+        raise NotImplementedError
+
+
+# --- Gemini backend (google-genai SDK, forced function calling) --------------
+
+
+def _gemini_usage(response) -> dict:
+    """Normalize a google-genai response's usage_metadata (best-effort)."""
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        return _new_usage()
+    return {
+        "prompt": getattr(um, "prompt_token_count", 0) or 0,
+        "output": getattr(um, "candidates_token_count", 0) or 0,
+        "thinking": getattr(um, "thoughts_token_count", 0) or 0,
+        "total": getattr(um, "total_token_count", 0) or 0,
+    }
+
+
+class GeminiSession(Session):
+    def __init__(self, provider: "GeminiProvider", config: "types.GenerateContentConfig"):
+        self._provider = provider
+        self._config = config
+        self._contents: list[types.Content] = []
+
+    def add_user(self, text: str) -> None:
+        self._contents.append(
+            types.Content(role="user", parts=[types.Part(text=text)])
+        )
+
+    def step(self) -> tuple[dict | None, dict]:
+        response = _retry(
+            lambda: self._provider.client().models.generate_content(
+                model=self._provider.model, contents=self._contents, config=self._config
+            ),
+            label="Gemini",
+        )
+        usage = _gemini_usage(response)
+        calls = response.function_calls or []
+        if not calls:
+            return None, usage
+        self._contents.append(response.candidates[0].content)  # preserve model turn
+        return dict(calls[0].args or {}), usage
+
+    def add_tool_result(self, text: str) -> None:
+        # The function_response must echo the (only) tool name so Gemini pairs it
+        # with the preceding forced call.
+        self._contents.append(
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_function_response(
+                        name=TOOL_NAME, response={"result": text}
+                    )
+                ],
+            )
+        )
+
+
+class GeminiProvider(Provider):
+    name = "gemini"
+    model = "gemini-3.5-flash"           # latest GA Gemini generation
+    summarizer_model = "gemini-3.5-flash"
+    thinking_level = "high"              # "high" maximizes reasoning depth; "low" is cheaper
+    env_var = "GEMINI_API_KEY"
+
+    _client: "genai.Client | None" = None
+
+    def client(self) -> "genai.Client":
+        if GeminiProvider._client is None:
+            self.require_key()
+            GeminiProvider._client = genai.Client(api_key=os.environ[self.env_var])
+        return GeminiProvider._client
+
+    def new_session(self, *, system_instruction, temperature, max_output_tokens) -> Session:
+        config = types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            thinking_config=types.ThinkingConfig(thinking_level=self.thinking_level),
+            tools=[UPDATE_BELIEF_TOOL],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="ANY", allowed_function_names=[TOOL_NAME]
+                )
+            ),
+        )
+        return GeminiSession(self, config)
+
+    def complete(self, *, model, system, prompt, temperature, max_output_tokens,
+                 thinking_level="low") -> tuple[str, dict]:
+        config = types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+            thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
+            **({"system_instruction": system} if system else {}),
+        )
+        response = _retry(
+            lambda: self.client().models.generate_content(
+                model=model, contents=prompt, config=config
+            ),
+            label="Gemini",
+        )
+        return (response.text or "").strip(), _gemini_usage(response)
+
+
+# --- DeepSeek backend (OpenAI-compatible API, JSON structured output) --------
+#
+# DeepSeek V4 runs in thinking mode by default and rejects forced tool_choice
+# (HTTP 400 "Thinking mode does not support this tool_choice"), so instead of a
+# forced function call we constrain the reply to a JSON object (response_format)
+# and parse the belief out of it. Same structured fields, different mechanism.
+
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
+
+def _openai_usage(response) -> dict:
+    """Normalize an OpenAI-style usage object. `completion_tokens` already
+    includes reasoning tokens, so split them so output excludes thinking
+    (matching the Gemini convention; both bill as output)."""
+    u = getattr(response, "usage", None)
+    if u is None:
+        return _new_usage()
+    completion = getattr(u, "completion_tokens", 0) or 0
+    details = getattr(u, "completion_tokens_details", None)
+    reasoning = (getattr(details, "reasoning_tokens", 0) or 0) if details else 0
+    return {
+        "prompt": getattr(u, "prompt_tokens", 0) or 0,
+        "output": max(0, completion - reasoning),
+        "thinking": reasoning,
+        "total": getattr(u, "total_tokens", 0) or 0,
+    }
+
+
+def _parse_json_object(text: str) -> dict | None:
+    """Best-effort parse of a JSON object from a model reply (tolerates fences)."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        match = re.search(r"\{.*\}", text, re.DOTALL)  # last resort: outermost {...}
+        if not match:
+            return None
+        try:
+            obj = json.loads(match.group(0))
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+
+class DeepSeekSession(Session):
+    def __init__(self, provider: "DeepSeekProvider", system_instruction: str,
+                 temperature: float, max_output_tokens: int):
+        self._provider = provider
+        self._temperature = temperature
+        self._max_output_tokens = max_output_tokens
+        self._messages: list[dict] = [
+            {"role": "system", "content": system_instruction + JSON_OUTPUT_INSTRUCTION}
+        ]
+
+    def add_user(self, text: str) -> None:
+        self._messages.append({"role": "user", "content": text})
+
+    def step(self) -> tuple[dict | None, dict]:
+        response = _retry(
+            lambda: self._provider.client().chat.completions.create(
+                model=self._provider.model,
+                messages=self._messages,
+                temperature=self._temperature,
+                max_tokens=self._max_output_tokens,
+                response_format={"type": "json_object"},
+            ),
+            label="DeepSeek",
+        )
+        usage = _openai_usage(response)
+        content = response.choices[0].message.content or ""
+        belief = _parse_json_object(content)
+        if belief is None:
+            return None, usage
+        self._messages.append({"role": "assistant", "content": content})  # preserve model turn
+        return belief, usage
+
+    def add_tool_result(self, text: str) -> None:
+        # No real tool call was made (JSON mode), so the result comes back as a
+        # plain user turn rather than an OpenAI tool message.
+        self._messages.append({"role": "user", "content": text})
+
+
+class DeepSeekProvider(Provider):
+    name = "deepseek"
+    model = "deepseek-v4-pro"            # main reasoning model
+    summarizer_model = "deepseek-v4-flash"  # cheap tier for summaries + briefing
+    thinking_level = "default"           # V4 thinks by default; no high/low knob
+    env_var = "DEEPSEEK_API_KEY"
+
+    _client = None  # openai.OpenAI
+
+    def client(self):
+        if DeepSeekProvider._client is None:
+            self.require_key()
+            from openai import OpenAI  # lazy import: only when this provider is used
+            DeepSeekProvider._client = OpenAI(
+                api_key=os.environ[self.env_var], base_url=DEEPSEEK_BASE_URL
+            )
+        return DeepSeekProvider._client
+
+    def new_session(self, *, system_instruction, temperature, max_output_tokens) -> Session:
+        return DeepSeekSession(self, system_instruction, temperature, max_output_tokens)
+
+    def complete(self, *, model, system, prompt, temperature, max_output_tokens,
+                 thinking_level="low") -> tuple[str, dict]:
+        messages = ([{"role": "system", "content": system}] if system else []) + [
+            {"role": "user", "content": prompt}
+        ]
+        response = _retry(
+            lambda: self.client().chat.completions.create(
+                model=model, messages=messages,
+                temperature=temperature, max_tokens=max_output_tokens,
+            ),
+            label="DeepSeek",
+        )
+        return (response.choices[0].message.content or "").strip(), _openai_usage(response)
+
+
+# --- Provider registry + active selection ------------------------------------
+
+PROVIDERS: dict[str, type[Provider]] = {
+    "gemini": GeminiProvider,
+    "deepseek": DeepSeekProvider,
+}
+DEFAULT_PROVIDER = "gemini"
+
+_provider: Provider | None = None
 _brave_api_key: str | None = None
 
 
-def get_genai_client() -> genai.Client:
-    """Return a cached Gemini client (reads GEMINI_API_KEY from the env)."""
-    global _genai_client
-    if _genai_client is None:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError(f"GEMINI_API_KEY is not set (expected in {ENV_PATH}).")
-        _genai_client = genai.Client(api_key=api_key)
-    return _genai_client
+def set_provider(name: str) -> Provider:
+    """Select the active LLM backend by name (see PROVIDERS)."""
+    global _provider
+    if name not in PROVIDERS:
+        raise ValueError(f"unknown provider {name!r}; choose from {sorted(PROVIDERS)}")
+    _provider = PROVIDERS[name]()
+    return _provider
+
+
+def get_provider() -> Provider:
+    """Return the active provider, defaulting to DEFAULT_PROVIDER on first use."""
+    if _provider is None:
+        return set_provider(DEFAULT_PROVIDER)
+    return _provider
 
 
 def get_brave_api_key() -> str:
@@ -433,7 +800,7 @@ def summarize(
     resolution_criteria: str | None = None,
     usage: dict | None = None,
 ) -> str:
-    """Summarize selected search-result files with the sub-LLM (Gemini Flash).
+    """Summarize selected search-result files with the provider's sub-LLM.
 
     Acts as an assistant to the superforecaster: it extracts only the facts and
     data from the documents relevant to the question's resolution, without adding
@@ -448,35 +815,34 @@ def summarize(
     )
     criteria = (resolution_criteria or "").strip() or "(not separately specified)"
     combined = "\n\n---\n\n".join(docs)[:SUMMARIZER_MAX_DOC_CHARS]
+    provider = get_provider()
     try:
-        response = _generate(
-            model=SUMMARIZER_MODEL,
-            contents=f"Specifically: {instruction}\n\nSearch results:\n\n{combined}",
-            config=types.GenerateContentConfig(
-                system_instruction=(
-                    "You are an assistant to a superforecaster. Extract the facts "
-                    "and data from the search results that are most relevant to "
-                    "predicting the outcome of this question.\n\n"
-                    f"Question: {question}\n"
-                    f"Resolution criteria: {criteria}\n\n"
-                    "Instructions:\n"
-                    "- Extract concrete facts, statistics, dates, and named-source "
-                    "expert opinions.\n"
-                    "- Note any quantitative data (prices, percentages, counts, "
-                    "trends).\n"
-                    "- Distinguish hard facts from speculation or editorial opinion.\n"
-                    "- Omit information not relevant to the resolution criteria.\n"
-                    "- Do NOT add your own analysis or forecast — only extract what "
-                    f"the sources say.\n\n{NO_MARKETS_RULE}"
-                ),
-                temperature=0.3,
-                max_output_tokens=SUMMARIZER_MAX_TOKENS,
-                thinking_config=types.ThinkingConfig(thinking_level="low"),
+        text, delta = provider.complete(
+            model=provider.summarizer_model,
+            system=(
+                "You are an assistant to a superforecaster. Extract the facts "
+                "and data from the search results that are most relevant to "
+                "predicting the outcome of this question.\n\n"
+                f"Question: {question}\n"
+                f"Resolution criteria: {criteria}\n\n"
+                "Instructions:\n"
+                "- Extract concrete facts, statistics, dates, and named-source "
+                "expert opinions.\n"
+                "- Note any quantitative data (prices, percentages, counts, "
+                "trends).\n"
+                "- Distinguish hard facts from speculation or editorial opinion.\n"
+                "- Omit information not relevant to the resolution criteria.\n"
+                "- Do NOT add your own analysis or forecast — only extract what "
+                f"the sources say.\n\n{NO_MARKETS_RULE}"
             ),
+            prompt=f"Specifically: {instruction}\n\nSearch results:\n\n{combined}",
+            temperature=0.3,
+            max_output_tokens=SUMMARIZER_MAX_TOKENS,
+            thinking_level="low",
         )
         if usage is not None:
-            _add_usage(usage, response)
-        return (response.text or "").strip() or "Summary was empty."
+            _merge_usage(usage, delta)
+        return text or "Summary was empty."
     except Exception as exc:
         logger.warning("summarization failed: %s", exc)
         return f"Summarization failed: {exc}"
@@ -487,43 +853,6 @@ def summarize(
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
-
-
-def _new_usage() -> dict:
-    return {"prompt": 0, "output": 0, "thinking": 0, "total": 0}
-
-
-def _add_usage(acc: dict, response) -> None:
-    """Add one response's token usage to an accumulator (best-effort)."""
-    um = getattr(response, "usage_metadata", None)
-    if um is None:
-        return
-    acc["prompt"] += getattr(um, "prompt_token_count", 0) or 0
-    acc["output"] += getattr(um, "candidates_token_count", 0) or 0
-    acc["thinking"] += getattr(um, "thoughts_token_count", 0) or 0
-    acc["total"] += getattr(um, "total_token_count", 0) or 0
-
-
-def _generate(*, model, contents, config, attempts: int = 4):
-    """generate_content with retries + backoff on transient failures.
-
-    A dropped connection or 5xx (e.g. httpx.RemoteProtocolError) shouldn't kill a
-    long run, so we retry a few times with exponential backoff before giving up.
-    """
-    for attempt in range(1, attempts + 1):
-        try:
-            return get_genai_client().models.generate_content(
-                model=model, contents=contents, config=config
-            )
-        except Exception as exc:
-            if attempt == attempts:
-                raise
-            wait = 2 ** attempt  # 2, 4, 8 seconds
-            logger.warning(
-                "Gemini call failed (attempt %d/%d): %s — retrying in %ds",
-                attempt, attempts, type(exc).__name__, wait,
-            )
-            time.sleep(wait)
 
 
 def run_read_files(
@@ -569,15 +898,15 @@ def run_agent(
 ) -> dict:
     """Run a single forecasting agent loop and return its final belief.
 
-    The model is forced to call `update_belief_and_act` at every step (function
-    calling mode 'ANY'). On a 'web_search' action we run Brave Search, write each
-    result's full text to a per-run scratch file, and feed back only short
-    snippets (each tagged with a file id). On a 'read_files' action we summarize
-    the chosen files via the sub-LLM and feed back the summary (progressive
-    disclosure — the heavy text never floods the main context). On 'submit' (or
-    when the step budget is exhausted) we return the last belief — the tool-call
-    arguments (probability, evidence_for/against, reasoning, ...) with
-    `probability` clamped to [0.05, 0.95].
+    At every step the model emits the `update_belief_and_act` fields (a forced
+    function call on Gemini, constrained JSON on DeepSeek). On a 'web_search'
+    action we run Brave Search, write each result's full text to a per-run scratch
+    file, and feed back only short snippets (each tagged with a file id). On a
+    'read_files' action we summarize the chosen files via the sub-LLM and feed
+    back the summary (progressive disclosure — the heavy text never floods the
+    main context). On 'submit' (or when the step budget is exhausted) we return
+    the last belief — the recorded fields (probability, evidence_for/against,
+    reasoning, ...) with `probability` clamped to [0.05, 0.95].
 
     If `prior` (a probability in [0, 1]) is given, the agent starts anchored on
     it instead of forming its own base rate (prior injection).
@@ -586,35 +915,17 @@ def run_agent(
         raise ValueError(f"prior must be a probability in [0, 1], got {prior!r}")
 
     today = datetime.now().strftime("%Y-%m-%d (%A)")
-    config = types.GenerateContentConfig(
+    session = get_provider().new_session(
         system_instruction=(
             f"{SYSTEM_PROMPT}\n\n"
             f"Today's date is {today}; do not search for the current date."
         ),
         temperature=TEMPERATURE,
         max_output_tokens=MAX_OUTPUT_TOKENS,
-        thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
-        tools=[UPDATE_BELIEF_TOOL],
-        tool_config=types.ToolConfig(
-            function_calling_config=types.FunctionCallingConfig(
-                mode="ANY",
-                allowed_function_names=[TOOL_NAME],
-            )
-        ),
     )
-
-    contents: list[types.Content] = [
-        types.Content(
-            role="user",
-            parts=[
-                types.Part(
-                    text=build_initial_message(
-                        question, prior, background, resolution_criteria
-                    )
-                )
-            ],
-        )
-    ]
+    session.add_user(
+        build_initial_message(question, prior, background, resolution_criteria)
+    )
     probability = 0.5  # fallback prior if the loop exits unexpectedly
     belief: dict = {
         "probability": probability,
@@ -643,17 +954,16 @@ def run_agent(
 
     try:
         for step in range(1, max_steps + 1):
-            response = _generate(model=MODEL, contents=contents, config=config)
-            _add_usage(usage, response)
+            step_belief, delta = session.step()
+            _merge_usage(usage, delta)
 
-            calls = response.function_calls or []
-            if not calls:
-                # Should not happen under forced function calling; bail with current estimate.
-                logger.warning("step %d: no function call returned; stopping early", step)
+            if step_belief is None:
+                # No structured output this turn (e.g. the model declined to emit
+                # the JSON / tool call); bail with the current estimate.
+                logger.warning("step %d: no structured belief returned; stopping early", step)
                 break
-            call = calls[0]
 
-            belief = dict(call.args or {})
+            belief = step_belief
             probability = _clamp(float(belief.get("probability", probability)), 0.05, 0.95)
             belief["probability"] = probability  # store the clamped value
             action = belief.get("action", "submit")
@@ -690,8 +1000,7 @@ def run_agent(
                 }
             )
 
-            # Preserve the model's function-call turn.
-            contents.append(response.candidates[0].content)
+            # (the model's turn was recorded inside session.step())
 
             if action == "submit" or step == max_steps:
                 terminated_by = "submit" if action == "submit" else "budget"
@@ -716,18 +1025,7 @@ def run_agent(
                     results, search_index, scratch, registry, sources, query
                 )
 
-            # The function_response must echo call.name (the only tool) so Gemini
-            # pairs it with the preceding call — true for both action branches.
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part.from_function_response(
-                            name=call.name, response={"result": result}
-                        )
-                    ],
-                )
-            )
+            session.add_tool_result(result)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -809,22 +1107,22 @@ def summarize_forecast(
         "anywhere in the briefing, even if the per-trial notes above reference them. "
         "Build the case for and against from substantive evidence only."
     )
+    provider = get_provider()
     try:
-        response = _generate(
-            model=MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=2048,
-                thinking_config=types.ThinkingConfig(thinking_level="low"),
-            ),
+        text, delta = provider.complete(
+            model=provider.summarizer_model,
+            system=None,
+            prompt=prompt,
+            temperature=0.3,
+            max_output_tokens=2048,
+            thinking_level="low",
         )
     except Exception as exc:  # a briefing failure must not lose the forecast
         logger.warning("briefing synthesis failed: %s", exc)
         return f"(briefing unavailable: {exc})"
     if usage is not None:
-        _add_usage(usage, response)
-    return (response.text or "").strip()
+        _merge_usage(usage, delta)
+    return text
 
 
 def _apply_calibration(probability: float, category: str | None) -> float | None:
@@ -860,9 +1158,10 @@ def aggregate_forecasts(
     available), the per-trial spread, and a synthesized briefing.
     """
     logger.info(
-        "Forecasting in %d trials | model=%s | prior=%s | question: %s",
+        "Forecasting in %d trials | provider=%s model=%s | prior=%s | question: %s",
         num_trials,
-        MODEL,
+        get_provider().name,
+        get_provider().model,
         f"{prior:.0%}" if prior is not None else "none",
         question,
     )
@@ -964,13 +1263,16 @@ def save_run(
         "category": result.category,  # calibration source key
         "outcome": None,  # fill in via --resolve once the question resolves
         "prior": prior,
-        "model": MODEL,
-        "thinking_level": THINKING_LEVEL,
+        "provider": get_provider().name,
+        "model": get_provider().model,
+        "summarizer_model": get_provider().summarizer_model,
+        "thinking_level": get_provider().thinking_level,
         "num_trials": num_trials if num_trials is not None else len(result.trials),
         "probability": result.probability,  # raw aggregate (feeds calibration fits)
         "calibrated_probability": result.calibrated_probability,
         "trial_probabilities": result.trial_probabilities,
         "usage": result.usage,  # run-level token totals
+        "est_cost_usd": cost_usd(result.usage, get_provider().model),
         "summary": result.summary,
         "trials": result.trials,
         **(extra or {}),
@@ -1110,6 +1412,13 @@ def main() -> None:
         help=f"Independent runs to aggregate (default: {NUM_TRIALS}).",
     )
     parser.add_argument(
+        "--provider",
+        choices=sorted(PROVIDERS),
+        default=DEFAULT_PROVIDER,
+        help=f"LLM backend (default: {DEFAULT_PROVIDER}). 'deepseek' needs "
+        "DEEPSEEK_API_KEY; 'gemini' needs GEMINI_API_KEY.",
+    )
+    parser.add_argument(
         "--category",
         default=None,
         help="Question category (e.g. a Polymarket tag) — the calibration source "
@@ -1173,8 +1482,9 @@ def main() -> None:
     if args.prior is not None and not 0.0 <= args.prior <= 1.0:
         parser.error("--prior must be a probability between 0 and 1")
 
+    provider = set_provider(args.provider)
     missing = [
-        key for key in ("GEMINI_API_KEY", "BRAVE_API_KEY") if not os.environ.get(key)
+        key for key in (provider.env_var, "BRAVE_API_KEY") if not os.environ.get(key)
     ]
     if missing:
         raise SystemExit(
@@ -1212,6 +1522,15 @@ def main() -> None:
             f"Calibrated probability: {result.calibrated_probability:.3f}   "
             f"(category: {result.category or 'uncategorized'})"
         )
+    u = result.usage or {}
+    est = cost_usd(u, provider.model)
+    cost_str = f"≈ ${est:.4f}" if est is not None else "n/a"
+    print(
+        f"Provider: {provider.name} ({provider.model})   "
+        f"tokens: {u.get('total', 0):,} (prompt {u.get('prompt', 0):,}, "
+        f"output {u.get('output', 0):,}, thinking {u.get('thinking', 0):,})   "
+        f"est. cost: {cost_str}"
+    )
     print(f"Saved to: {saved_path.relative_to(Path.cwd()) if saved_path.is_relative_to(Path.cwd()) else saved_path}")
 
 

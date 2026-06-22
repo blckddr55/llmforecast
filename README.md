@@ -4,24 +4,37 @@ A web-grounded agent that estimates the probability of a forecasting question by
 reasoning like a superforecaster: it starts from a base rate and performs
 explicit Bayesian updates as it gathers evidence from the web.
 
-It uses **Google Gemini** (function calling) for reasoning and the **Brave Search
-API** for web search.
+It uses a **pluggable LLM backend** for reasoning and the **Brave Search API** for
+web search. Two backends ship today, selectable with `--provider` so cost and
+quality can be compared head-to-head:
+
+- **`gemini`** (default) — Google Gemini via the google-genai SDK, using *forced
+  function calling*.
+- **`deepseek`** — DeepSeek V4 via its OpenAI-compatible API, using *JSON
+  structured output* (DeepSeek V4 runs in thinking mode and rejects forced
+  `tool_choice`, so the reply shape is constrained instead).
+
+The agent loop is provider-agnostic; each backend just implements the structured
+"belief" step and a plain-text completion.
 
 ## How it works
 
-At every step the model is *forced* to call a single function,
-`update_belief_and_act`, which records:
+At every step the model records a single structured object,
+`update_belief_and_act` (a forced function call on Gemini, constrained JSON on
+DeepSeek), which contains:
 
 - `probability` — the current posterior, calibrated to `[0.05, 0.95]`
 - `confidence` — `low` / `medium` / `high`
 - `evidence_for` / `evidence_against` — concrete supporting / contradicting evidence
 - `update_reasoning` — the Bayesian update just performed
-- `action` — `web_search` or `submit`
-- `action_input` — a search query, or a final justification
+- `action` — `web_search`, `read_files`, or `submit`
+- `action_input` — a search query, an extraction instruction, or a final justification
 
-When the action is `web_search`, the agent runs a Brave search, feeds the results
-back as a function response, and updates again — up to `MAX_STEPS` (10). When it
-`submit`s (or the step budget runs out), the run returns its final probability.
+When the action is `web_search`, the agent runs a Brave search and feeds the
+results back; `read_files` pulls chosen results in full through a cheaper
+summarizer (progressive disclosure). It updates again each step — up to
+`MAX_STEPS` (14). When it `submit`s (or the step budget runs out), the run
+returns its final probability.
 Prediction-market and betting sites are excluded from the search, and the model
 is told not to treat their odds as evidence — so the forecast rests on primary
 sources rather than echoing a market price.
@@ -46,7 +59,8 @@ own base rate.
 
 - Python ≥ 3.12
 - [uv](https://docs.astral.sh/uv/)
-- A Google Gemini API key and a Brave Search API key
+- A Brave Search API key, plus an API key for the backend you run: a Google
+  Gemini key (default) and/or a DeepSeek key
 
 ## Setup
 
@@ -61,7 +75,8 @@ Create a `.env` from the template and add your keys (`.env` is git-ignored):
 ```bash
 cp .env.example .env
 # then edit .env:
-#   GEMINI_API_KEY=...
+#   GEMINI_API_KEY=...     # for --provider gemini (default)
+#   DEEPSEEK_API_KEY=sk-... # for --provider deepseek
 #   BRAVE_API_KEY=...
 ```
 
@@ -70,6 +85,9 @@ cp .env.example .env
 ```bash
 # Default example question, no prior:
 uv run forecaster.py
+
+# Run against DeepSeek instead of Gemini (needs DEEPSEEK_API_KEY):
+uv run forecaster.py --provider deepseek "Will X happen before 2027?"
 
 # Inject a prior anchor (a market price or historical base rate):
 uv run forecaster.py --prior 0.10
@@ -245,14 +263,17 @@ again to pick up the next batch.
 
 ## Configuration
 
-The knobs live at the top of `forecaster.py`:
+The shared knobs live at the top of `forecaster.py`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `MODEL` | `gemini-3.5-flash` | Gemini model |
-| `MAX_STEPS` | `10` | Max agent steps per run |
+| `MAX_STEPS` | `14` | Max agent steps per run |
 | `NUM_TRIALS` | `5` | Independent runs aggregated per question |
 | `MAX_OUTPUT_TOKENS` | `8192` | Output token cap per call (headroom for thinking) |
 | `TEMPERATURE` | `1.0` | Sampling temperature (so trials diverge) |
-| `THINKING_LEVEL` | `"high"` | Gemini 3 thinking depth — `"low"` or `"high"` |
-| `BRAVE_MAX_RESULTS` | `5` | Results per search |
+| `BRAVE_MAX_RESULTS` | `10` | Results per search |
+
+The model names, the cheaper summarizer model, and the thinking level are
+per-backend and live on each `Provider` subclass (`GeminiProvider`,
+`DeepSeekProvider`). Pick the backend at runtime with `--provider`; estimated
+per-run token cost (from `PRICING_PER_MTOK`) is printed and saved on each run.

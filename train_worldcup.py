@@ -18,6 +18,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 
+import forecaster
 import polymarket
 from train_markets import (
     _iso,
@@ -107,6 +108,10 @@ def main() -> None:
                         help="cap the number of matches forecast")
     parser.add_argument("--trials", type=int, default=5,
                         help="independent runs aggregated per market (default: 5)")
+    parser.add_argument("--provider", choices=sorted(forecaster.PROVIDERS),
+                        default=forecaster.DEFAULT_PROVIDER,
+                        help=f"LLM backend (default: {forecaster.DEFAULT_PROVIDER}); "
+                        "'deepseek' needs DEEPSEEK_API_KEY, 'gemini' needs GEMINI_API_KEY")
     parser.add_argument("--use-market-prior", action=argparse.BooleanOptionalAction, default=True,
                         help="inject each market's price as the prior anchor (default: on; "
                         "pass --no-use-market-prior to forecast independently)")
@@ -146,7 +151,8 @@ def main() -> None:
         print_tasks(tasks, args.trials, args.category)
         return
 
-    missing = [k for k in ("GEMINI_API_KEY", "BRAVE_API_KEY") if not os.environ.get(k)]
+    provider = forecaster.set_provider(args.provider)
+    missing = [k for k in (provider.env_var, "BRAVE_API_KEY") if not os.environ.get(k)]
     if missing:
         raise SystemExit(f"Missing required environment variable(s): {', '.join(missing)}")
 

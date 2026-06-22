@@ -388,6 +388,10 @@ def main() -> None:
                         "(applied after de-duplicating against runs/)")
     parser.add_argument("--trials", type=int, default=5,
                         help="independent runs aggregated per market (default: 5)")
+    parser.add_argument("--provider", choices=sorted(forecaster.PROVIDERS),
+                        default=forecaster.DEFAULT_PROVIDER,
+                        help=f"LLM backend (default: {forecaster.DEFAULT_PROVIDER}); "
+                        "'deepseek' needs DEEPSEEK_API_KEY, 'gemini' needs GEMINI_API_KEY")
     parser.add_argument("--use-market-prior", action=argparse.BooleanOptionalAction, default=True,
                         help="inject each market's price as the prior anchor — the model "
                         "starts from it and updates on evidence (default: on; pass "
@@ -442,7 +446,8 @@ def main() -> None:
         print_tasks(tasks, args.trials, category)
         return
 
-    missing = [k for k in ("GEMINI_API_KEY", "BRAVE_API_KEY") if not os.environ.get(k)]
+    provider = forecaster.set_provider(args.provider)
+    missing = [k for k in (provider.env_var, "BRAVE_API_KEY") if not os.environ.get(k)]
     if missing:
         raise SystemExit(f"Missing required environment variable(s): {', '.join(missing)}")
 
