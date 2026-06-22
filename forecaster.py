@@ -340,17 +340,30 @@ def cost_usd(usage: dict | None, model: str) -> float | None:
     return ((usage.get("prompt", 0) or 0) * in_rate + billed_output * out_rate) / 1_000_000
 
 
+def _is_permanent_error(exc: Exception) -> bool:
+    """True for client errors that won't be fixed by retrying (bad key, no
+    balance, bad request, ...): a 4xx HTTP status other than 429 rate-limit.
+
+    Reads the status off whichever attribute the SDK exposes (`status_code` on
+    the OpenAI SDK, `code` on google-genai errors)."""
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int):
+        status = getattr(exc, "code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status != 429
+
+
 def _retry(call, *, attempts: int = 4, label: str = "LLM"):
     """Call `call()` with exponential backoff on transient failures.
 
     A dropped connection or 5xx (e.g. httpx.RemoteProtocolError) shouldn't kill a
-    long run, so we retry a few times before giving up.
+    long run, so we retry a few times before giving up. Permanent client errors
+    (auth, insufficient balance, bad request) fail fast — retrying can't help.
     """
     for attempt in range(1, attempts + 1):
         try:
             return call()
         except Exception as exc:
-            if attempt == attempts:
+            if _is_permanent_error(exc) or attempt == attempts:
                 raise
             wait = 2 ** attempt  # 2, 4, 8 seconds
             logger.warning(
