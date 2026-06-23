@@ -1002,6 +1002,73 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+# Search-result file ids look like 'search_1_result_3'; these are the only valid
+# citations (everything else the model emits as a source is unverifiable).
+_FILE_ID_RE = re.compile(r"search_\d+_result_\d+")
+
+
+def _validate_citations(belief: dict, valid_ids: set[str]) -> dict:
+    """Flag fabricated source citations against the run's real file-id registry.
+
+    The model is told to cite each reference case and evidence item by the file id
+    of the search result it came from. A reference case may instead be marked
+    'prior' (honest: recalled, not searched). Any other reference-case source_id —
+    or any search_*_result_* token in an evidence string — that is NOT a real id is
+    a fabrication (e.g. DeepSeek inventing 'history_source_1'). We rewrite a bogus
+    reference-case source_id to 'unverified' so it can't masquerade as grounded,
+    and return counts so ungrounded/fabricated forecasts are visible in telemetry.
+    Mutates `belief` in place; returns the audit.
+    """
+    rc = belief.get("reference_cases")
+    grounded = prior = fabricated = total = 0
+    if isinstance(rc, list):
+        for case in rc:
+            if not isinstance(case, dict):
+                continue
+            total += 1
+            sid = str(case.get("source_id", "")).strip()
+            if sid in valid_ids:
+                grounded += 1
+            elif sid == "prior":
+                prior += 1
+            else:  # cites a source that was never actually retrieved
+                fabricated += 1
+                case["source_id"] = "unverified"  # don't let a fake id look grounded
+    if fabricated:
+        logger.warning(
+            "%d reference case(s) cited a non-existent source id "
+            "(rewritten to 'unverified')", fabricated,
+        )
+
+    ev_cited = ev_valid = 0
+    ev_fabricated: list[str] = []
+    for key in ("evidence_for", "evidence_against"):
+        for item in belief.get(key) or []:
+            for tok in _FILE_ID_RE.findall(str(item)):
+                ev_cited += 1
+                if tok in valid_ids:
+                    ev_valid += 1
+                else:
+                    ev_fabricated.append(tok)
+    if ev_fabricated:
+        logger.warning(
+            "evidence cited %d file id(s) not in the registry: %s",
+            len(ev_fabricated), ", ".join(sorted(set(ev_fabricated))),
+        )
+
+    return {
+        "reference_cases": {
+            "total": total, "grounded": grounded,
+            "prior": prior, "fabricated": fabricated,
+        },
+        "evidence": {
+            "cited_ids": ev_cited, "valid": ev_valid,
+            "fabricated": len(ev_fabricated),
+            "fabricated_ids": sorted(set(ev_fabricated)),
+        },
+    }
+
+
 def run_read_files(
     question: str,
     belief: dict,
@@ -1200,6 +1267,10 @@ def run_agent(
             "on the first step)"
         )
 
+    # Flag fabricated citations against the real file-id registry (rewrites bogus
+    # reference-case source ids to 'unverified' in place; returns the audit).
+    citations = _validate_citations(belief, set(registry))
+
     # Attach the decision-process record (#1 trajectory, #2 provenance, #3 stats).
     belief["steps"] = trajectory
     belief["sources"] = sources
@@ -1209,6 +1280,7 @@ def run_agent(
         "n_reads": n_reads,
         "terminated_by": terminated_by,
         "seconds": round(time.perf_counter() - start, 1),
+        "citations": citations,
     }
     belief["usage"] = usage
     return belief

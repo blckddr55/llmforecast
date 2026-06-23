@@ -40,7 +40,7 @@ DeepSeek), which contains:
 
 - `probability` — the current posterior, calibrated to `[0.05, 0.95]`
 - `comparison_class` / `base_rate` — the outside-view reference class and its base rate (the anchor)
-- `reference_cases` — the specific comparable past cases (each with its outcome + source id) the base rate is researched from
+- `reference_cases` — the specific comparable past cases (each with its outcome + source id) the base rate is researched from. Each `source_id` is validated against the run's real search-result ids: an honest `prior` (recalled, not searched) is kept, but a fabricated id (a citation to a source that was never retrieved) is rewritten to `unverified`. Per-trial `stats.citations` records the grounded / prior / fabricated counts (and any fabricated file ids cited in the evidence lists)
 - `confidence` — `low` / `medium` / `high`
 - `evidence_for` / `evidence_against` — concrete supporting / contradicting evidence
 - `update_reasoning` — the Bayesian update just performed
