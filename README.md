@@ -184,6 +184,69 @@ after the scratch files are deleted), a `stats` block (`steps_used`, `n_searches
 `n_reads`, `terminated_by`, `seconds`), and per-trial `usage` (token counts). A
 run-level `usage` sums all trials plus the briefing, giving the exact token cost.
 
+## Honing CHAMPS KNOW adherence
+
+Calibration scores *outcomes*, but outcomes take months to resolve. To tune the
+prompt and schema fast, a **honing harness** scores how well a run *exhibited*
+each CHAMPS KNOW principle — straight from the saved telemetry, no resolution
+required.
+
+**`score_champs.py`** reads a saved run (or a whole directory of them) and prints a
+per-principle scorecard, `0..1` per principle. Most principles are scored
+**mechanically** from the run's telemetry; the three soft ones use a cheap
+DeepSeek-flash judge:
+
+| Principle | Scored from |
+| --- | --- |
+| **C** Comparison class | a non-trivial `comparison_class` is named |
+| **O** Outside view | `base_rate` present **and** `reference_cases` grounded — source ids that resolve to real searches, not fabricated |
+| **H** Hunt | depth of search + read activity |
+| **A** Adjust often | several incremental updates, no single wild logit-space lurch |
+| **M** Make precise | the final probability isn't a coarse round number |
+| **P** Pre-mortem · **S** Synthesize · **N** No sacred cows | a flash judge scores the submit justification 0–2 on each |
+
+`K` (Keep score) and `W` (Wisdom of crowds) are system-level — calibration and
+multi-trial aggregation — not per-run, so they aren't scored here.
+
+```bash
+# Score one run, or a whole batch (a directory of runs):
+uv run score_champs.py runs/<file>.json
+uv run score_champs.py eval_runs/baseline
+
+# Mechanical only — skip the flash judge for P/S/N (free, no LLM calls):
+uv run score_champs.py eval_runs/baseline --no-judge
+```
+
+The batch summary prints a **mean per principle** and flags the **weakest
+principle** — the one to hone next. A `⚠ N fabricated` marker appears on any run
+whose `reference_cases` cite source ids that were never retrieved.
+
+### A fixed eval set
+
+`run_eval.py` runs a **fixed set of questions** (`eval/champs_eval.json`) through a
+provider and saves the full runs to a labelled directory, so successive prompt
+versions can be scored and compared head-to-head. The set spans question *shapes*
+that each stress a different principle — a clean reference class (post-war
+midterms), an engineering schedule (Starship to orbit), a macro base rate (a 2026
+recession), a geopolitical near-one-off (a Russia–Ukraine ceasefire), a
+sparse-analogue novelty (a 'GPT-6' release), and a price threshold (Bitcoin >
+$150k).
+
+No market prior is injected (`prior=None`) on purpose: these aren't markets, so the
+agent must form its own `comparison_class` / `base_rate` — exactly the outside-view
+discipline being honed. Runs save to `eval_runs/<label>/`, kept out of `runs/` so
+the calibration set isn't polluted by repeated honing passes.
+
+```bash
+# Run the eval set (1 trial per question is enough for cheap honing):
+uv run run_eval.py --provider deepseek --trials 1 --label baseline
+
+# Change the prompt/schema, re-run under a new label, and compare scorecards:
+uv run run_eval.py --provider deepseek --trials 1 --label v2-grounding
+uv run score_champs.py eval_runs/baseline
+uv run score_champs.py eval_runs/v2-grounding
+```
+
 ## Calibration
 
 Forecasts are calibrated with hierarchical Platt scaling (`calibration.py`), keyed
