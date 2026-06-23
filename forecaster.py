@@ -145,7 +145,43 @@ UPDATE_BELIEF_FUNCTION = types.FunctionDeclaration(
                     "The outside-view base rate: the share of your comparison_class "
                     "that resolved YES, BEFORE case-specific evidence. This is your "
                     "anchor; the posterior should only move away from it as far as "
-                    "the evidence justifies."
+                    "the evidence justifies. Ground it in the cases you list in "
+                    "reference_cases — do not just assume a number."
+                ),
+            ),
+            "reference_cases": types.Schema(
+                type="ARRAY",
+                items=types.Schema(
+                    type="OBJECT",
+                    properties={
+                        "case": types.Schema(
+                            type="STRING",
+                            description="A specific past case comparable to this question.",
+                        ),
+                        "outcome": types.Schema(
+                            type="STRING",
+                            description="How it resolved — 'YES'/'NO' or a short factual outcome.",
+                        ),
+                        "source_id": types.Schema(
+                            type="STRING",
+                            description=(
+                                "The file id this case came from (e.g. "
+                                "search_2_result_1), or 'prior' if it is still from "
+                                "background knowledge you have NOT yet searched to confirm."
+                            ),
+                        ),
+                    },
+                    required=["case", "outcome", "source_id"],
+                ),
+                description=(
+                    "The concrete comparable cases your base_rate is built from, and "
+                    "how each resolved — the evidence FOR the outside view. Populate "
+                    "by RESEARCHING the reference class (not just naming it): the "
+                    "base_rate should reflect the YES-fraction of these cases. "
+                    "Accumulate and ground them as you search (replace 'prior' "
+                    "placeholders with real file ids). If the question is a genuine "
+                    "one-off with no clean analogues, return a single entry saying so "
+                    "rather than inventing cases."
                 ),
             ),
             "confidence": types.Schema(
@@ -205,6 +241,7 @@ UPDATE_BELIEF_FUNCTION = types.FunctionDeclaration(
             "probability",
             "comparison_class",
             "base_rate",
+            "reference_cases",
             "confidence",
             "evidence_for",
             "evidence_against",
@@ -230,10 +267,15 @@ SYSTEM_PROMPT = (
     "question resolves YES, working with the CHAMPS KNOW discipline from Philip "
     "Tetlock's research on what makes forecasters accurate.\n\n"
     "METHOD — CHAMPS KNOW:\n"
-    "- Comparison classes & Outside view (C, O): START from the outside. Identify "
-    "a reference class of similar past cases and the rate at which they resolved "
-    "YES, BEFORE weighing case-specific detail. Record these as `comparison_class` "
-    "and `base_rate`, and treat the base rate as the anchor you adjust away from.\n"
+    "- Comparison classes & Outside view (C, O): START from the outside. Name a "
+    "reference class of similar past cases (`comparison_class`), then RESEARCH it: "
+    "find specific comparable cases and how each resolved, list them in "
+    "`reference_cases` (each citing the file id it came from), and set `base_rate` "
+    "to the YES-rate across those cases. Do this BEFORE weighing case-specific "
+    "detail, and treat the base rate as the anchor you adjust away from. A base "
+    "rate you assumed rather than looked up is the single most common forecasting "
+    "error — so if your reference_cases are still 'prior' (unsearched), grounding "
+    "them is your priority.\n"
     "- Hunt for information (H): actively dig for primary, hard-to-find evidence — "
     "official data, original documents, domain-specific facts — not punditry or "
     "commentary. Go past the obvious sources.\n"
@@ -261,8 +303,10 @@ SYSTEM_PROMPT = (
     "3. Submit (action='submit') once the estimate has stabilized, further "
     "evidence is unlikely to move it, AND you have run the pre-mortem.\n\n"
     "Belief-state rules:\n"
-    "- Carry `comparison_class` and `base_rate` forward on every step (refine the "
-    "base rate only if you find a better reference class).\n"
+    "- Carry `comparison_class`, `base_rate`, and `reference_cases` forward on "
+    "every step. Refine the base rate as you ground more cases (replace 'prior' "
+    "placeholders with real file ids); keep base_rate consistent with the YES-rate "
+    "of the cases you have actually found.\n"
     "- Evidence lists (evidence_for / evidence_against) must ACCUMULATE across "
     "steps: carry forward what still holds and add to it — do not start fresh.\n"
     "- Each evidence item MUST cite its source by file id (e.g. search_1_result_3).\n"
@@ -298,6 +342,9 @@ JSON_OUTPUT_INSTRUCTION = (
     '  "probability": number between 0.05 and 0.95 (be precise, e.g. 0.78),\n'
     '  "comparison_class": string — the reference class for your base rate,\n'
     '  "base_rate": number 0.05–0.95 — the outside-view base rate (your anchor),\n'
+    '  "reference_cases": array of {"case","outcome","source_id"} — the comparable '
+    'past cases the base_rate is built from (cite the file id each came from, or '
+    '"prior" if not yet researched),\n'
     '  "confidence": one of "low", "medium", "high",\n'
     '  "evidence_for": array of strings (each citing a file id),\n'
     '  "evidence_against": array of strings (each citing a file id),\n'
@@ -1110,6 +1157,7 @@ def run_agent(
                     ),
                     "n_evidence_for": len(belief.get("evidence_for") or []),
                     "n_evidence_against": len(belief.get("evidence_against") or []),
+                    "n_reference_cases": len(belief.get("reference_cases") or []),
                 }
             )
 

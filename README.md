@@ -24,7 +24,7 @@ superforecasting. Each principle is operationalized in the loop:
 
 | Principle | How it shows up |
 | --- | --- |
-| **C**omparison classes / **O**utside view | The agent must name a `comparison_class` and a `base_rate` and anchor on it before weighing case-specific detail |
+| **C**omparison classes / **O**utside view | The agent must name a `comparison_class`, **research the comparable past cases** into `reference_cases` (each with its outcome + source), and set `base_rate` to their YES-rate — anchoring on it before weighing case-specific detail |
 | **H**unt for information | Brave search + `read_files`, prompted to dig for primary data over punditry; a higher step budget rewards deeper hunting |
 | **A**djust often | Many small, evidence-proportioned Bayesian updates per step rather than big jumps |
 | **M**ake precise estimates | A numeric `probability` (e.g. `0.78`), never vague language |
@@ -40,6 +40,7 @@ DeepSeek), which contains:
 
 - `probability` — the current posterior, calibrated to `[0.05, 0.95]`
 - `comparison_class` / `base_rate` — the outside-view reference class and its base rate (the anchor)
+- `reference_cases` — the specific comparable past cases (each with its outcome + source id) the base rate is researched from
 - `confidence` — `low` / `medium` / `high`
 - `evidence_for` / `evidence_against` — concrete supporting / contradicting evidence
 - `update_reasoning` — the Bayesian update just performed
