@@ -33,6 +33,7 @@ def main() -> None:
 
     forecaster.set_provider(args.provider)
     out_dir = Path("eval_runs") / args.label
+    out_dir.mkdir(parents=True, exist_ok=True)  # save_run's mkdir won't create parents
     forecaster.RUNS_DIR = out_dir  # redirect save_run away from the real runs/ dir
 
     questions = [q["question"] for q in json.load(open(EVAL_PATH))]
