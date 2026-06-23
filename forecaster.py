@@ -1381,6 +1381,26 @@ def _apply_calibration(probability: float, category: str | None) -> float | None
     return float(calibration.apply(probability, category or "uncategorized", fit))
 
 
+def _is_confabulated(belief: dict) -> bool:
+    """True if a trial reached `submit` without grounding — its probability is noise.
+
+    Two signals, each meaning the stated evidence is untethered from anything the
+    agent actually retrieved:
+      * it never hunted — `n_searches == 0` and `n_reads == 0`; or
+      * every source it cited is fabricated — nothing grounded, something faked.
+    Such a trial must not feed the logit-space mean (see `aggregate_forecasts`).
+    """
+    st = belief.get("stats") or {}
+    if not (st.get("n_searches") or 0) and not (st.get("n_reads") or 0):
+        return True
+    cit = st.get("citations") or {}
+    rc = cit.get("reference_cases") or {}
+    ev = cit.get("evidence") or {}
+    grounded = (rc.get("grounded") or 0) + (ev.get("valid") or 0)
+    fabricated = (rc.get("fabricated") or 0) + (ev.get("fabricated") or 0)
+    return grounded == 0 and fabricated > 0
+
+
 def aggregate_forecasts(
     question: str,
     prior: float | None = None,
@@ -1439,11 +1459,35 @@ def aggregate_forecasts(
 
     if not beliefs:
         raise RuntimeError(f"all {num_trials} trials failed for {question!r}")
-    probabilities = [float(b["probability"]) for b in beliefs]
+
+    # Quarantine confabulated trials (gathered no evidence, or cited only fabricated
+    # sources): their probability is ungrounded noise, so keep it out of the logit-
+    # space mean and the briefing. Flag them in place so the saved run still records
+    # them and why they were dropped. If EVERY trial confabulated, fall back to using
+    # them all — a noisy forecast beats none.
+    for b in beliefs:
+        b["excluded_from_aggregate"] = _is_confabulated(b)
+    counted = [b for b in beliefs if not b["excluded_from_aggregate"]]
+    if len(counted) < len(beliefs):
+        logger.warning(
+            "Excluded %d/%d confabulated trial(s) from the aggregate "
+            "(no evidence gathered, or all citations fabricated)",
+            len(beliefs) - len(counted), len(beliefs),
+        )
+    if not counted:
+        logger.warning(
+            "All trials were confabulated; aggregating them anyway so a forecast "
+            "is still produced"
+        )
+        counted = beliefs
+        for b in beliefs:
+            b["excluded_from_aggregate"] = False
+
+    probabilities = [float(b["probability"]) for b in counted]
     aggregated = float(expit(np.mean(logit(np.asarray(probabilities)))))
 
     logger.info(
-        "All trials %s | logit-space mean=%.3f | elapsed %.1fs",
+        "Counted trials %s | logit-space mean=%.3f | elapsed %.1fs",
         [round(p, 3) for p in probabilities],
         aggregated,
         time.perf_counter() - overall_start,
@@ -1459,7 +1503,7 @@ def aggregate_forecasts(
         )
 
     logger.info("Synthesizing final briefing...")
-    summary = summarize_forecast(question, beliefs, aggregated, prior, usage=total_usage)
+    summary = summarize_forecast(question, counted, aggregated, prior, usage=total_usage)
     logger.info(
         "Total tokens: %d (prompt %d, output %d, thinking %d)",
         total_usage["total"],

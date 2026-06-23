@@ -20,6 +20,7 @@ import glob
 import json
 import math
 import os
+import re
 import statistics
 
 import forecaster
@@ -50,6 +51,20 @@ def _grounding(trial: dict) -> tuple[int, int, int, int]:
         else:
             fab += 1
     return total, grounded, prior, fab
+
+
+_FILE_ID_RE = re.compile(r"search_\d+_result_\d+")
+
+
+def _evidence_fab(trial: dict) -> int:
+    """Evidence citations to source ids that were never retrieved — recomputed from
+    raw data (same rule as forecaster._validate_citations) so it works on old runs."""
+    valid = set((trial.get("sources") or {}).keys())
+    fab = 0
+    for key in ("evidence_for", "evidence_against"):
+        for item in trial.get(key) or []:
+            fab += sum(1 for tok in _FILE_ID_RE.findall(str(item)) if tok not in valid)
+    return fab
 
 
 def score_trial_mechanical(trial: dict) -> dict:
@@ -153,12 +168,37 @@ def score_run(path: str, judge: bool) -> dict:
         js, jw = score_trial_judge(d.get("question", ""), trials[0])  # judge representative trial
         avg.update({k: round(v, 2) for k, v in js.items()})
         why = jw
+
+    # Aggregate the raw basis across ALL trials (not just trial 0) so the detail line
+    # reflects the whole run and surfaces per-trial failures — 0-hunt confabulation,
+    # fabricated citations, and trials excluded from the logit-space mean.
+    g = [_grounding(t) for t in trials]
+    domains = {(v.get("url") or "").split("/")[2]
+               for t in trials for v in (t.get("sources") or {}).values()
+               if (v.get("url") or "").count("/") >= 2}
+    raws = [m["_raw"] for m in mech]
+    stat = lambda t, k: (t.get("stats") or {}).get(k, 0) or 0  # noqa: E731
+    probs = [t["probability"] for t in trials if t.get("probability") is not None]
+    agg = {
+        "n_trials": len(trials),
+        "ref_grounded": sum(x[1] for x in g), "ref_prior": sum(x[2] for x in g),
+        "ref_fab": sum(x[3] for x in g), "ref_total": sum(x[0] for x in g),
+        "searches": sum(stat(t, "n_searches") for t in trials),
+        "reads": sum(stat(t, "n_reads") for t in trials),
+        "domains": len(domains),
+        "n_updates": sum(r["n_updates"] for r in raws),
+        "max_logit_jump": round(max((r["max_logit_jump"] for r in raws), default=0.0), 2),
+        "ev_fab": sum(_evidence_fab(t) for t in trials),
+        "zero_hunt": sum(1 for t in trials if not stat(t, "n_searches") and not stat(t, "n_reads")),
+        "excluded": sum(1 for t in trials if t.get("excluded_from_aggregate")),
+        "prange": (f"{min(probs):.2f}–{max(probs):.2f}" if probs else "?"),
+    }
     return {
         "file": os.path.basename(path),
         "question": (d.get("question") or "")[:70],
         "provider": d.get("provider"),
         "scores": avg,
-        "raw": mech[0]["_raw"],
+        "agg": agg,
         "judge_why": why,
     }
 
@@ -182,10 +222,21 @@ def main() -> None:
     for c in cards:
         row = " ".join(f"{c['scores'].get(p, 0):>4.2f}" for p in principles)
         print(f"{c['question']:<52} {row}")
-        print(f"    └ {c['raw']['ref_cases']} | {c['raw']['searches']}s/{c['raw']['reads']}r/"
-              f"{c['raw']['domains']}dom | {c['raw']['n_updates']} updates, max jump "
-              f"{c['raw']['max_logit_jump']} | p={c['raw']['probability']}"
-              + (f" | ⚠ {c['raw']['fabricated']} fabricated" if c['raw']['fabricated'] else ""))
+        a = c["agg"]
+        print(f"    └ {a['n_trials']} trials | refs {a['ref_grounded']}g/{a['ref_prior']}p/"
+              f"{a['ref_fab']}f of {a['ref_total']} | {a['searches']}s/{a['reads']}r/{a['domains']}dom"
+              f" | {a['n_updates']} updates, worst jump {a['max_logit_jump']} | p∈[{a['prange']}]")
+        flags = []
+        if a["ref_fab"]:
+            flags.append(f"⚠ {a['ref_fab']} fabricated ref-cite(s)")
+        if a["ev_fab"]:
+            flags.append(f"⚠ {a['ev_fab']} fabricated evidence-cite(s)")
+        if a["zero_hunt"]:
+            flags.append(f"⚠ {a['zero_hunt']}/{a['n_trials']} trial(s) 0-hunt")
+        if a["excluded"]:
+            flags.append(f"⛔ {a['excluded']} excluded from mean")
+        if flags:
+            print(f"      {' · '.join(flags)}")
 
     if cards:
         batch = {p: round(statistics.mean(c["scores"].get(p, 0) for c in cards), 2) for p in principles}
