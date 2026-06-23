@@ -48,9 +48,10 @@ DeepSeek), which contains:
 
 When the action is `web_search`, the agent runs a Brave search and feeds the
 results back; `read_files` pulls chosen results in full through a cheaper
-summarizer (progressive disclosure). It updates again each step — up to
-`MAX_STEPS` (24). When it `submit`s (or the step budget runs out), the run
-returns its final probability.
+summarizer (progressive disclosure). It updates again each step — up to a
+per-provider step budget (`Provider.max_steps`: 14 for Gemini, 24 for the cheaper
+DeepSeek). When it `submit`s (or the step budget runs out), the run returns its
+final probability.
 Prediction-market and betting sites are excluded from the search, and the model
 is told not to treat their odds as evidence — so the forecast rests on primary
 sources rather than echoing a market price.
@@ -283,13 +284,16 @@ The shared knobs live at the top of `forecaster.py`:
 
 | Constant | Default | Meaning |
 | --- | --- | --- |
-| `MAX_STEPS` | `24` | Max agent steps per run (raised for deeper hunting on the cheap backend) |
 | `NUM_TRIALS` | `5` | Independent runs aggregated per question |
-| `MAX_OUTPUT_TOKENS` | `8192` | Output token cap per call (headroom for thinking) |
 | `TEMPERATURE` | `1.0` | Sampling temperature (so trials diverge) |
 | `BRAVE_MAX_RESULTS` | `10` | Results per search |
 
-The model names, the cheaper summarizer model, and the thinking level are
-per-backend and live on each `Provider` subclass (`GeminiProvider`,
-`DeepSeekProvider`). Pick the backend at runtime with `--provider`; estimated
-per-run token cost (from `PRICING_PER_MTOK`) is printed and saved on each run.
+Everything backend-specific lives on each `Provider` subclass (`GeminiProvider`,
+`DeepSeekProvider`): the model name, the cheaper summarizer model, the thinking
+level, and — because cost-per-depth differs sharply by backend — the per-run
+**`max_steps`** budget and **`max_output_tokens`** cap. Defaults: Gemini
+`max_steps=14` (its per-step context grows, so cost climbs fast), DeepSeek
+`max_steps=24` with a larger `max_output_tokens` (V4 reasons heavily before
+emitting its JSON belief). Pick the backend at runtime with `--provider`;
+estimated per-run token cost (from `PRICING_PER_MTOK`) is printed and saved on
+each run.

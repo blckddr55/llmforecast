@@ -65,17 +65,14 @@ CALIBRATION_PATH = Path(__file__).resolve().parent / "calibration_fit.json"
 
 # --- Configuration -----------------------------------------------------------
 #
-# The LLM backend (model names + thinking level) is selected at runtime via the
-# provider layer below (see Provider / --provider); the knobs here are shared
-# across providers.
+# The LLM backend (model names, thinking level, per-run step budget, and output
+# token cap) is selected at runtime via the provider layer below (see Provider /
+# --provider); the knobs here are shared across providers. The step budget is
+# per-provider because the cost of a deep run differs sharply by backend — on
+# Gemini the per-step context grows so cost climbs steeply with the budget, while
+# the cheaper DeepSeek tier can afford to hunt far longer (see Provider.max_steps).
 
-MAX_STEPS = 24  # max agent steps per run before forcing a submission (read_files adds
-#               # round-trips). Raised now that the cheap DeepSeek tier makes deeper
-#               # hunting affordable; CHAMPS KNOW rewards more searches + incremental
-#               # updates. Note: on Gemini the per-step context grows, so cost climbs
-#               # with the budget — the headroom mostly benefits the cheaper backend.
 NUM_TRIALS = 5  # independent runs aggregated per question
-MAX_OUTPUT_TOKENS = 8192  # headroom for high-effort thinking + the structured function call
 TEMPERATURE = 1.0  # >0 so the NUM_TRIALS runs genuinely diverge
 BRAVE_MAX_RESULTS = 10  # snippets shown per search (full text goes to files, not context)
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
@@ -284,7 +281,8 @@ SYSTEM_PROMPT = (
     "- 'submit': finalize — put your pre-mortem and a brief justification in "
     "action_input.\n\n"
     "Rules:\n"
-    f"- You MUST submit before step {MAX_STEPS}.\n"
+    "- You work within a fixed step budget (stated below) and MUST submit before "
+    "it runs out.\n"
     "- Keep hunting and adjusting until the estimate stabilizes; on a genuinely "
     "uncertain question, do NOT submit after a shallow look — gather more "
     "evidence first.\n"
@@ -463,6 +461,8 @@ class Provider:
     summarizer_model: str  # cheaper model for file summaries + the final briefing
     thinking_level: str    # recorded on saved runs; meaning is provider-specific
     env_var: str
+    max_steps: int = 14          # agent steps per run before a forced submission
+    max_output_tokens: int = 8192  # output cap per agent call (incl. thinking room)
 
     def require_key(self) -> None:
         if not os.environ.get(self.env_var):
@@ -542,6 +542,8 @@ class GeminiProvider(Provider):
     summarizer_model = "gemini-3.5-flash"
     thinking_level = "high"              # "high" maximizes reasoning depth; "low" is cheaper
     env_var = "GEMINI_API_KEY"
+    max_steps = 14            # kept modest: per-step context grows, so cost climbs fast
+    max_output_tokens = 8192
 
     _client: "genai.Client | None" = None
 
@@ -643,20 +645,42 @@ class DeepSeekSession(Session):
     def add_user(self, text: str) -> None:
         self._messages.append({"role": "user", "content": text})
 
-    def step(self) -> tuple[dict | None, dict]:
+    _REPARSE_NUDGE = (
+        "Your previous reply was not a single valid JSON object. Respond now with "
+        "ONLY the JSON object described — no prose, no markdown fences."
+    )
+
+    def _generate(self, usage: dict, *, nudge: bool = False) -> str:
+        """One create() call; merge its usage into `usage` and return the content.
+
+        With `nudge`, a transient corrective instruction is appended for this call
+        only (not persisted) — used to re-ask after an unparseable reply."""
+        messages = self._messages
+        if nudge:
+            messages = messages + [{"role": "user", "content": self._REPARSE_NUDGE}]
         response = _retry(
             lambda: self._provider.client().chat.completions.create(
                 model=self._provider.model,
-                messages=self._messages,
+                messages=messages,
                 temperature=self._temperature,
                 max_tokens=self._max_output_tokens,
                 response_format={"type": "json_object"},
             ),
             label="DeepSeek",
         )
-        usage = _openai_usage(response)
-        content = response.choices[0].message.content or ""
+        _merge_usage(usage, _openai_usage(response))
+        return response.choices[0].message.content or ""
+
+    def step(self) -> tuple[dict | None, dict]:
+        usage = _new_usage()
+        content = self._generate(usage)
         belief = _parse_json_object(content)
+        if belief is None:
+            # The reply wasn't a parseable JSON belief (e.g. truncated after heavy
+            # reasoning, or stray prose). Re-ask once before giving up.
+            logger.warning("DeepSeek reply was not valid JSON; re-asking once")
+            content = self._generate(usage, nudge=True)
+            belief = _parse_json_object(content)
         if belief is None:
             return None, usage
         self._messages.append({"role": "assistant", "content": content})  # preserve model turn
@@ -674,6 +698,8 @@ class DeepSeekProvider(Provider):
     summarizer_model = "deepseek-v4-flash"  # cheap tier for summaries + briefing
     thinking_level = "default"           # V4 thinks by default; no high/low knob
     env_var = "DEEPSEEK_API_KEY"
+    max_steps = 24            # cheap enough to hunt deep (flat per-step context)
+    max_output_tokens = 16384  # extra headroom: V4 reasons heavily before the JSON belief
 
     _client = None  # openai.OpenAI
 
@@ -966,7 +992,7 @@ def run_read_files(
 def run_agent(
     question: str,
     prior: float | None = None,
-    max_steps: int = MAX_STEPS,
+    max_steps: int | None = None,
     background: str | None = None,
     resolution_criteria: str | None = None,
 ) -> dict:
@@ -988,14 +1014,20 @@ def run_agent(
     if prior is not None and not 0.0 <= prior <= 1.0:
         raise ValueError(f"prior must be a probability in [0, 1], got {prior!r}")
 
+    provider = get_provider()
+    if max_steps is None:
+        max_steps = provider.max_steps
+
     today = datetime.now().strftime("%Y-%m-%d (%A)")
-    session = get_provider().new_session(
+    session = provider.new_session(
         system_instruction=(
             f"{SYSTEM_PROMPT}\n\n"
+            f"Your step budget is {max_steps} steps; you MUST submit before it "
+            "runs out.\n"
             f"Today's date is {today}; do not search for the current date."
         ),
         temperature=TEMPERATURE,
-        max_output_tokens=MAX_OUTPUT_TOKENS,
+        max_output_tokens=provider.max_output_tokens,
     )
     session.add_user(
         build_initial_message(question, prior, background, resolution_criteria)
@@ -1109,6 +1141,16 @@ def run_agent(
             session.add_tool_result(result)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+    # If the model never produced a single parseable belief, there is no forecast
+    # to report — only the 0.5 fallback. Treat that as a failed trial (raise) so
+    # aggregate_forecasts discards it instead of polluting the mean with a fake
+    # 0.5. (A 'no_call' AFTER some good steps keeps the last real belief.)
+    if not trajectory:
+        raise RuntimeError(
+            "agent produced no structured belief (model returned no valid output "
+            "on the first step)"
+        )
 
     # Attach the decision-process record (#1 trajectory, #2 provenance, #3 stats).
     belief["steps"] = trajectory
