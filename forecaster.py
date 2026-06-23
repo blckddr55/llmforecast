@@ -712,6 +712,7 @@ class DeepSeekSession(Session):
                 temperature=self._temperature,
                 max_tokens=self._max_output_tokens,
                 response_format={"type": "json_object"},
+                **self._provider._reasoning_kwargs(),
             ),
             label="DeepSeek",
         )
@@ -743,7 +744,12 @@ class DeepSeekProvider(Provider):
     name = "deepseek"
     model = "deepseek-v4-pro"            # main reasoning model
     summarizer_model = "deepseek-v4-flash"  # cheap tier for summaries + briefing
-    thinking_level = "default"           # V4 thinks by default; no high/low knob
+    thinking_level = "default"           # recorded on runs; reasoning_effort is the live knob
+    # V4 Pro accepts an OpenAI-style reasoning_effort knob; "high" forces a longer
+    # self-correcting chain-of-thought that sharply cuts the "answer anyway"
+    # confabulation. Read from the env so it can be A/B'd; "", "off", "none", or
+    # "default" send no param (the API's own default behaviour).
+    reasoning_effort = os.environ.get("DEEPSEEK_REASONING_EFFORT", "high")
     env_var = "DEEPSEEK_API_KEY"
     max_steps = 24            # cheap enough to hunt deep (flat per-step context)
     max_output_tokens = 16384  # extra headroom: V4 reasons heavily before the JSON belief
@@ -761,6 +767,11 @@ class DeepSeekProvider(Provider):
 
     def new_session(self, *, system_instruction, temperature, max_output_tokens) -> Session:
         return DeepSeekSession(self, system_instruction, temperature, max_output_tokens)
+
+    def _reasoning_kwargs(self) -> dict:
+        """Extra create() kwargs carrying reasoning_effort, when configured."""
+        eff = (self.reasoning_effort or "").strip().lower()
+        return {"reasoning_effort": eff} if eff not in ("", "off", "none", "default") else {}
 
     def complete(self, *, model, system, prompt, temperature, max_output_tokens,
                  thinking_level="low") -> tuple[str, dict]:
@@ -1230,6 +1241,25 @@ def run_agent(
 
             # (the model's turn was recorded inside session.step())
 
+            # Hard guard (prevention): refuse a 'submit' issued before ANY evidence
+            # was gathered — the DeepSeek "answer anyway" confabulation. Re-prompt and
+            # force another step instead of accepting a zero-hunt forecast. Bounded by
+            # the step budget; a model that never searches still submits at the budget
+            # edge, where the aggregate-level quarantine (_is_confabulated) catches it.
+            if (action == "submit" and step < max_steps
+                    and search_index == 0 and n_reads == 0):
+                logger.warning(
+                    "step %d: 'submit' before any web_search/read_files; "
+                    "re-prompting to gather evidence first", step,
+                )
+                session.add_tool_result(
+                    "You attempted to submit before gathering any evidence. A forecast "
+                    "with zero searches is not acceptable. Run at least one web_search "
+                    "(then read_files on the best results) to ground your estimate "
+                    "BEFORE submitting. Continue now with action='web_search'."
+                )
+                continue
+
             if action == "submit" or step == max_steps:
                 terminated_by = "submit" if action == "submit" else "budget"
                 if action == "submit":
@@ -1554,6 +1584,7 @@ def save_run(
         "model": get_provider().model,
         "summarizer_model": get_provider().summarizer_model,
         "thinking_level": get_provider().thinking_level,
+        "reasoning_effort": getattr(get_provider(), "reasoning_effort", None),
         "num_trials": num_trials if num_trials is not None else len(result.trials),
         "probability": result.probability,  # raw aggregate (feeds calibration fits)
         "calibrated_probability": result.calibrated_probability,
