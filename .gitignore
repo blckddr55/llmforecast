@@ -14,3 +14,8 @@ wheels/
 
 # Generated calibration fit (derived from resolved runs)
 calibration_fit.json
+eval_runs/
+eval_baseline.log
+compare*.py
+compare*.json
+compare*.log

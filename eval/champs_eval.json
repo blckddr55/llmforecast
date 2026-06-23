@@ -1,0 +1,26 @@
+[
+  {
+    "question": "Will the incumbent president's party lose seats in the US House in the 2026 midterm elections?",
+    "note": "strong, clean reference class (post-war midterms) — tests C/O grounding"
+  },
+  {
+    "question": "Will SpaceX's Starship reach orbit before the end of 2026?",
+    "note": "schedule/engineering base rate — diverged Gemini vs DeepSeek before"
+  },
+  {
+    "question": "Will the US economy enter a recession (two consecutive quarters of negative real GDP growth) during 2026?",
+    "note": "macro base rate vs current data — tests A (incremental updates)"
+  },
+  {
+    "question": "Will a ceasefire between Russia and Ukraine remain in effect on 31 December 2026?",
+    "note": "geopolitical near one-off — tests whether it forces an honest reference class"
+  },
+  {
+    "question": "Will OpenAI publicly release a model branded 'GPT-6' before the end of 2026?",
+    "note": "novel-ish event, sparse reference class — tests the no-clean-analogue path"
+  },
+  {
+    "question": "Will Bitcoin trade above $150,000 at any point in 2026?",
+    "note": "market/price base rate — we have a prior baseline for this one"
+  }
+]
