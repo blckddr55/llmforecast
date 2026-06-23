@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv
 
+# IDE / editor
+.idea/
+.vscode/
+
 # Local secrets
 .env
 
