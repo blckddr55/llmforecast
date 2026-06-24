@@ -26,6 +26,7 @@ def main() -> None:
     ap.add_argument("--provider", choices=sorted(forecaster.PROVIDERS), default="deepseek")
     ap.add_argument("--trials", type=int, default=1, help="trials per question (1 for cheap honing)")
     ap.add_argument("--label", required=True, help="output dir label, e.g. 'baseline' or 'v2-grounding'")
+    ap.add_argument("--limit", type=int, default=None, help="run only the first N questions (cheap A/B)")
     args = ap.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(message)s",
@@ -37,6 +38,8 @@ def main() -> None:
     forecaster.RUNS_DIR = out_dir  # redirect save_run away from the real runs/ dir
 
     questions = [q["question"] for q in json.load(open(EVAL_PATH))]
+    if args.limit is not None:
+        questions = questions[:args.limit]
     logging.info("Eval set: %d questions | provider=%s trials=%d -> %s",
                  len(questions), args.provider, args.trials, out_dir)
 
