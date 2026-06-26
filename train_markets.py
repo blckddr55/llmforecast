@@ -31,10 +31,6 @@ import polymarket
 logger = logging.getLogger("train_markets")
 
 
-def _iso(dt: datetime) -> str:
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _to_float(value, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -124,11 +120,13 @@ def fetch_tag_markets(
     de-duplicates against runs/ and applies any `--limit`.
     """
     now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=within_days)
+    # No event-level date window: an event's endDate is unreliable for "by <date>?"
+    # ladders (earlier OR later than the open rungs), so dates are filtered per
+    # market below (polymarket.market_in_window) — not server-side on the event.
     base = {
         "active": "true",
         "closed": "false",
-        "end_date_min": _iso(now),
-        "end_date_max": _iso(now + timedelta(days=within_days)),
         "liquidity_min": min_liquidity,
         "order": "liquidity",
         "ascending": "false",
@@ -149,7 +147,9 @@ def fetch_tag_markets(
         title = event.get("title") or ""
         eligible = []
         for market in event.get("markets") or []:
-            if market.get("closed") or not _is_binary(market):
+            if not polymarket.market_in_window(market, event.get("endDate"), now, horizon):
+                continue  # closed, or resolves outside [now, now + within_days]
+            if not _is_binary(market):
                 continue
             if pattern and (pattern.search(market.get("question") or "") or pattern.search(title)):
                 continue
@@ -176,11 +176,11 @@ def list_tags(
     exclude). Discovery only: price/exclude filters are not applied.
     """
     now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=within_days)
+    # Dates filtered per market (see fetch_tag_markets), not via an event window.
     base = {
         "active": "true",
         "closed": "false",
-        "end_date_min": _iso(now),
-        "end_date_max": _iso(now + timedelta(days=within_days)),
         "liquidity_min": min_liquidity,
         "order": "liquidity",
         "ascending": "false",
@@ -197,6 +197,11 @@ def list_tags(
     counts: Counter = Counter()
     labels: dict = {}
     for e in events.values():
+        if not any(
+            polymarket.market_in_window(m, e.get("endDate"), now, horizon)
+            for m in (e.get("markets") or [])
+        ):
+            continue  # no market in this event resolves within the window
         for t in e.get("tags") or []:
             slug = t.get("slug")
             if slug:

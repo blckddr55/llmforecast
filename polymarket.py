@@ -27,11 +27,6 @@ _HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 _PAGE_LIMIT = 100  # Gamma's max page size
 
 
-def _iso(dt: datetime) -> str:
-    """Format a UTC datetime the way the Gamma date filters expect."""
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def _parse_dt(value) -> datetime | None:
     """Parse a Gamma ISO timestamp (e.g. '2026-07-20T00:00:00Z') to aware UTC.
 
@@ -43,6 +38,23 @@ def _parse_dt(value) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+
+
+def market_in_window(
+    market: dict, event_end: str | None, now: datetime, horizon: datetime
+) -> bool:
+    """True if `market` is open and resolves within [now, horizon].
+
+    The date check is authoritative PER MARKET: a "by <date>?" ladder bundles
+    staggered sub-markets under one event whose `endDate` is unreliable (it can be
+    earlier OR later than the open rungs), so it must not gate the rungs. Uses the
+    market's own `endDate`, falling back to the event's only if absent, and drops
+    a market that is individually `closed` even when its parent event is open.
+    """
+    if market.get("closed"):
+        return False
+    end = _parse_dt(market.get("endDate") or event_end)
+    return end is not None and now <= end <= horizon
 
 
 def _to_float(value) -> float:
@@ -99,17 +111,18 @@ def fetch_markets(
     """Fetch open events whose markets resolve within `within_days` (liquidity >= `min_liquidity`).
 
     Hits the public Gamma `/events` endpoint, filtering server-side by liquidity
-    and an event-level end-date window [now, now + within_days] and ordering by
-    liquidity (descending), paginating until exhausted (or `max_results` is
-    reached). If `tag_slug` is given (e.g. "politics", "sports", "crypto"), only
-    events carrying that tag are returned (also filtered server-side).
+    and ordering by liquidity (descending), paginating until exhausted. If
+    `tag_slug` is given (e.g. "politics", "sports", "crypto"), only events carrying
+    that tag are returned (also filtered server-side).
 
-    The authoritative date filter is then applied PER MARKET: within each event,
-    only markets whose own `endDate` falls in [now, now + within_days] (and that
-    are not individually `closed`) are kept, and an event left with no qualifying
-    market is dropped. The server-side event window stays as an efficiency
-    prefilter — safe because Gamma keeps an event's markets on a single end date
-    (staggered ones are split into separate events).
+    The date filter is applied entirely PER MARKET (see `market_in_window`): within
+    each event, only open markets whose own `endDate` falls in [now, now +
+    within_days] are kept, and an event left with no qualifying market is dropped.
+    There is deliberately NO server-side event-date window — an event's `endDate`
+    is unreliable for "by <date>?" ladders (it can be earlier OR later than the
+    open rungs), so any event-level window hides rungs that actually resolve in
+    range. `max_results` caps the returned events AFTER this filter (so it counts
+    in-window events, not raw ones).
 
     Returns one dict per event: `id`, `slug`, `title`, `tags` (label list),
     `endDate`, `liquidity`, `volume`, and `markets` — a list of
@@ -121,26 +134,18 @@ def fetch_markets(
         "active": "true",
         "closed": "false",
         "liquidity_min": min_liquidity,
-        "end_date_min": _iso(now),
-        "end_date_max": _iso(horizon),
         "order": "liquidity",
         "ascending": "false",
     }
     if tag_slug:
         filters["tag_slug"] = tag_slug
 
-    def _market_in_window(market: dict, event_end: str | None) -> bool:
-        if market.get("closed"):
-            return False  # drop a closed market even if its event is still open
-        end = _parse_dt(market.get("endDate") or event_end)  # fall back to event's
-        return end is not None and now <= end <= horizon
-
     events = []
-    for e in fetch_events_raw(filters, max_results):
+    for e in fetch_events_raw(filters):
         markets = [
             {"question": m.get("question", ""), "prices": _parse_prices(m)}
             for m in (e.get("markets") or [])
-            if _market_in_window(m, e.get("endDate"))
+            if market_in_window(m, e.get("endDate"), now, horizon)
         ]
         if not markets:
             continue  # nothing in this event resolves within the window
@@ -156,6 +161,8 @@ def fetch_markets(
                 "markets": markets,
             }
         )
+        if max_results and len(events) >= max_results:
+            break  # cap on IN-WINDOW events, after per-market filtering
     logger.info(
         "fetched %d event(s) | liquidity >= $%s | ending within %d day(s)%s",
         len(events),
