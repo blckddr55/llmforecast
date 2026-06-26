@@ -1206,10 +1206,17 @@ PROVENANCE_SYSTEM = (
     "- primary_kind: one of poll | official_data | report | reporting | analysis\n"
     '- primary_id: a short, stable slug of the ORIGINAL source. For a poll use '
     '"<pollster>|<field-dates>", e.g. "cygnal|2026-05-07". Reuse the identical '
-    "slug for every source tracing to that same datum.\n"
+    "slug ONLY for sources tracing to the SAME named artifact (the same poll, "
+    "document, dataset, or official statement). Sharing a topic or event is NOT "
+    "enough — distinct statements from different bodies (e.g. a Qatar ministry "
+    "statement vs a White House release) are DISTINCT primary_ids, even when both "
+    "concern the same agreement. When unsure, give a more specific (less shared) "
+    "slug rather than merging.\n"
     '- sponsor: who commissioned or funded it; "" if independent or none\n'
-    "- partisan: true if that sponsor has a stake in the outcome (a campaign, "
-    "party, or advocacy PAC)\n"
+    "- partisan: true ONLY if the sponsor produced this datum to advance its own "
+    "side of THIS question (e.g. a campaign's internal poll, an advocacy PAC's "
+    "survey). A government or official body issuing a factual record or statement "
+    "is NOT partisan merely for being official.\n"
     "- measurement: raw | modeled_or_push | estimate | unknown — a post-message, "
     '"informed-ballot", or heavily modelled number is modeled_or_push\n'
     'Base every field only on the source text; if it is unclear, use "" or '
@@ -1317,11 +1324,26 @@ def _audit_source_independence(cited_ids: set[str], sources: dict) -> dict:
             push += 1
 
     real = {p: ids for p, ids in clusters.items() if not p.startswith("_ungrouped:")}
-    laundered = []
+    laundered, incoherent = [], []
     for pid, ids in real.items():
         domains = sorted({_registrable_domain((sources.get(i) or {}).get("url", "")) for i in ids} - {""})
-        if len(domains) > 1:  # one underlying datum, many outlets → false consensus
-            laundered.append({"primary_id": pid, "n_citations": len(ids), "domains": domains})
+        if len(domains) <= 1:
+            continue  # not spread across outlets — no false-consensus risk
+        entry = {"primary_id": pid, "n_citations": len(ids), "domains": domains}
+        # Coherence guard against over-clustering: one underlying datum has ONE
+        # origin, so if a cluster's members name two or more DISTINCT sponsors
+        # (e.g. "State of Qatar" AND "White House"), the fingerprinter merged
+        # separate primaries that merely share a topic — a clustering artifact,
+        # not laundering. Record it for telemetry but do NOT assert laundering
+        # (it would wrongly discount genuinely corroborating sources).
+        cl_sponsors = {
+            ((sources.get(i) or {}).get("provenance") or {}).get("sponsor", "").strip()
+            for i in ids
+        } - {""}
+        if len(cl_sponsors) >= 2:
+            incoherent.append({**entry, "sponsors": sorted(cl_sponsors)})
+        else:
+            laundered.append(entry)
 
     return {
         "fingerprinted": len(cited_ids) - unknown,
@@ -1329,6 +1351,7 @@ def _audit_source_independence(cited_ids: set[str], sources: dict) -> dict:
         "distinct_primaries": len(real),
         "max_cluster": max((len(ids) for ids in real.values()), default=0),
         "laundered": laundered,
+        "incoherent_clusters": incoherent,  # suppressed: distinct sponsors in one id
         "partisan_sponsors": sorted(sponsors),
         "modeled_or_push": push,
     }
