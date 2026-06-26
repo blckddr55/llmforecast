@@ -1201,6 +1201,7 @@ def fingerprint_sources(
     if not isinstance(rows, list):
         logger.warning("provenance pass returned no usable 'sources' array")
         return
+    tagged = 0
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -1216,6 +1217,8 @@ def fingerprint_sources(
         }
         for fid in siblings:
             sources[fid]["provenance"] = prov
+            tagged += 1
+    logger.info("provenance: fingerprinted %d/%d cited source(s)", tagged, len(cited_ids))
 
 
 def _audit_source_independence(cited_ids: set[str], sources: dict) -> dict:
@@ -1460,31 +1463,33 @@ def run_agent(
                 )
 
             session.add_tool_result(result)
+
+        # If the model never produced a single parseable belief, there is no
+        # forecast to report — only the 0.5 fallback. Treat that as a failed trial
+        # (raise) so aggregate_forecasts discards it instead of polluting the mean
+        # with a fake 0.5. (A 'no_call' AFTER some good steps keeps the last belief.)
+        if not trajectory:
+            raise RuntimeError(
+                "agent produced no structured belief (model returned no valid "
+                "output on the first step)"
+            )
+
+        # Flag fabricated citations against the real file-id registry (rewrites
+        # bogus reference-case source ids to 'unverified' in place; returns the
+        # audit). Tier 1 (domain diversity) rides along inside _validate_citations.
+        citations = _validate_citations(belief, set(registry), sources)
+
+        # Tier 2: fingerprint the cited sources and flag one-datum-many-outlets
+        # laundering. Must run BEFORE the `finally` tears down scratch — the
+        # fingerprinter reads the full search-result files, which live only there.
+        # One cheap call, so gate it on enough citations to matter and allow
+        # opt-out for cheap A/B passes (FORECAST_SKIP_PROVENANCE=1).
+        cited_valid = set(citations["evidence"]["cited_valid_ids"])
+        if len(cited_valid) >= PROVENANCE_MIN_CITED and os.environ.get("FORECAST_SKIP_PROVENANCE") != "1":
+            fingerprint_sources(cited_valid, sources, registry, usage)
+            citations["independence"] = _audit_source_independence(cited_valid, sources)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
-
-    # If the model never produced a single parseable belief, there is no forecast
-    # to report — only the 0.5 fallback. Treat that as a failed trial (raise) so
-    # aggregate_forecasts discards it instead of polluting the mean with a fake
-    # 0.5. (A 'no_call' AFTER some good steps keeps the last real belief.)
-    if not trajectory:
-        raise RuntimeError(
-            "agent produced no structured belief (model returned no valid output "
-            "on the first step)"
-        )
-
-    # Flag fabricated citations against the real file-id registry (rewrites bogus
-    # reference-case source ids to 'unverified' in place; returns the audit).
-    # Tier 1 (domain diversity) rides along inside _validate_citations.
-    citations = _validate_citations(belief, set(registry), sources)
-
-    # Tier 2: fingerprint the cited sources and flag one-datum-many-outlets
-    # laundering. One cheap call, so gate it on enough citations to matter and
-    # allow opt-out for cheap A/B passes (FORECAST_SKIP_PROVENANCE=1).
-    cited_valid = set(citations["evidence"]["cited_valid_ids"])
-    if len(cited_valid) >= PROVENANCE_MIN_CITED and os.environ.get("FORECAST_SKIP_PROVENANCE") != "1":
-        fingerprint_sources(cited_valid, sources, registry, usage)
-        citations["independence"] = _audit_source_independence(cited_valid, sources)
 
     # Attach the decision-process record (#1 trajectory, #2 provenance, #3 stats).
     belief["steps"] = trajectory
