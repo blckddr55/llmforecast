@@ -32,6 +32,19 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _parse_dt(value) -> datetime | None:
+    """Parse a Gamma ISO timestamp (e.g. '2026-07-20T00:00:00Z') to aware UTC.
+
+    Returns None on a missing or unparseable value so callers can skip it.
+    """
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
 def _to_float(value) -> float:
     try:
         return float(value)
@@ -83,47 +96,66 @@ def fetch_markets(
     max_results: int | None = None,
     tag_slug: str | None = None,
 ) -> list[dict]:
-    """Fetch open events with liquidity >= `min_liquidity` ending within `within_days`.
+    """Fetch open events whose markets resolve within `within_days` (liquidity >= `min_liquidity`).
 
     Hits the public Gamma `/events` endpoint, filtering server-side by liquidity
-    and an end-date window [now, now + within_days] and ordering by liquidity
-    (descending), paginating until exhausted (or `max_results` is reached). If
-    `tag_slug` is given (e.g. "politics", "sports", "crypto"), only events
-    carrying that tag are returned (also filtered server-side).
+    and an event-level end-date window [now, now + within_days] and ordering by
+    liquidity (descending), paginating until exhausted (or `max_results` is
+    reached). If `tag_slug` is given (e.g. "politics", "sports", "crypto"), only
+    events carrying that tag are returned (also filtered server-side).
+
+    The authoritative date filter is then applied PER MARKET: within each event,
+    only markets whose own `endDate` falls in [now, now + within_days] (and that
+    are not individually `closed`) are kept, and an event left with no qualifying
+    market is dropped. The server-side event window stays as an efficiency
+    prefilter — safe because Gamma keeps an event's markets on a single end date
+    (staggered ones are split into separate events).
 
     Returns one dict per event: `id`, `slug`, `title`, `tags` (label list),
     `endDate`, `liquidity`, `volume`, and `markets` — a list of
     {question, prices: [(outcome, prob), ...]}.
     """
     now = datetime.now(timezone.utc)
+    horizon = now + timedelta(days=within_days)
     filters = {
         "active": "true",
         "closed": "false",
         "liquidity_min": min_liquidity,
         "end_date_min": _iso(now),
-        "end_date_max": _iso(now + timedelta(days=within_days)),
+        "end_date_max": _iso(horizon),
         "order": "liquidity",
         "ascending": "false",
     }
     if tag_slug:
         filters["tag_slug"] = tag_slug
 
-    events = [
-        {
-            "id": e.get("id"),
-            "slug": e.get("slug"),
-            "title": e.get("title"),
-            "tags": [t.get("label") for t in (e.get("tags") or []) if t.get("label")],
-            "endDate": e.get("endDate"),
-            "liquidity": _to_float(e.get("liquidity")),
-            "volume": _to_float(e.get("volume")),
-            "markets": [
-                {"question": m.get("question", ""), "prices": _parse_prices(m)}
-                for m in (e.get("markets") or [])
-            ],
-        }
-        for e in fetch_events_raw(filters, max_results)
-    ]
+    def _market_in_window(market: dict, event_end: str | None) -> bool:
+        if market.get("closed"):
+            return False  # drop a closed market even if its event is still open
+        end = _parse_dt(market.get("endDate") or event_end)  # fall back to event's
+        return end is not None and now <= end <= horizon
+
+    events = []
+    for e in fetch_events_raw(filters, max_results):
+        markets = [
+            {"question": m.get("question", ""), "prices": _parse_prices(m)}
+            for m in (e.get("markets") or [])
+            if _market_in_window(m, e.get("endDate"))
+        ]
+        if not markets:
+            continue  # nothing in this event resolves within the window
+        events.append(
+            {
+                "id": e.get("id"),
+                "slug": e.get("slug"),
+                "title": e.get("title"),
+                "tags": [t.get("label") for t in (e.get("tags") or []) if t.get("label")],
+                "endDate": e.get("endDate"),
+                "liquidity": _to_float(e.get("liquidity")),
+                "volume": _to_float(e.get("volume")),
+                "markets": markets,
+            }
+        )
     logger.info(
         "fetched %d event(s) | liquidity >= $%s | ending within %d day(s)%s",
         len(events),
