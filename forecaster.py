@@ -1187,11 +1187,13 @@ def _validate_citations(belief: dict, valid_ids: set[str], sources: dict | None 
 # so the clustering in `_audit_source_independence` can flag the collapse.
 
 # The summarizer (deepseek-v4-flash) is a REASONING model and DeepSeek counts
-# reasoning + content against max_tokens together; a 1024 cap was fully consumed
-# by reasoning (300-650+ tokens, and it scales with source count), leaving zero
-# for the JSON answer — the call came back empty ("no usable 'sources' array").
-# Give it ample headroom so reasoning can't starve the output.
-PROVENANCE_MAX_TOKENS = 4096
+# reasoning + content against max_tokens together; reasoning length is variable
+# (300 to 1200+ tokens, scaling with source count) and a too-tight cap was fully
+# consumed by it, leaving zero for the JSON answer — the call came back empty.
+# Give generous headroom so even a reasoning spike can't starve the output, and
+# re-roll a few times since the variance also produces the occasional empty reply.
+PROVENANCE_MAX_TOKENS = 8192
+PROVENANCE_ATTEMPTS = 3
 PROVENANCE_MAX_SRC_CHARS = 2500  # per-source excerpt (the lead usually names the poll)
 PROVENANCE_MIN_CITED = 2         # below this there is no "independence" to assess
 
@@ -1256,32 +1258,41 @@ def fingerprint_sources(
         payload.append(f"[{rep}] {meta.get('title', '')}\n{meta.get('url', '')}\n{content}")
 
     provider = get_provider()
-    try:
-        text, delta = provider.complete(
-            model=provider.summarizer_model,
-            system=PROVENANCE_SYSTEM,
-            prompt="Fingerprint these sources:\n\n" + "\n\n---\n\n".join(payload),
-            temperature=0.0,
-            max_output_tokens=PROVENANCE_MAX_TOKENS,
-            thinking_level="low",
-        )
-    except Exception as exc:
-        logger.warning("provenance fingerprinting failed: %s", exc)
-        return
-    if usage is not None:
-        _merge_usage(usage, delta)
-
-    data = _parse_json_loose(text)
-    if isinstance(data, dict):
-        rows = data.get("sources")
-        if not isinstance(rows, list):  # tolerate an alternate top-level key
-            rows = next((v for v in data.values() if isinstance(v, list)), None)
-    elif isinstance(data, list):  # tolerate a bare top-level array
-        rows = data
-    else:
-        rows = None
+    prompt = "Fingerprint these sources:\n\n" + "\n\n---\n\n".join(payload)
+    # The flash model is a reasoning model whose reasoning length varies run to run
+    # (even at temperature 0), so it occasionally returns empty/unparseable output —
+    # which provider.complete's retry does NOT catch (an empty string isn't an
+    # error). Re-roll a couple of times on empty before giving up.
+    rows = None
+    for attempt in range(1, PROVENANCE_ATTEMPTS + 1):
+        try:
+            text, delta = provider.complete(
+                model=provider.summarizer_model,
+                system=PROVENANCE_SYSTEM,
+                prompt=prompt,
+                temperature=0.0,
+                max_output_tokens=PROVENANCE_MAX_TOKENS,
+                thinking_level="low",
+            )
+        except Exception as exc:
+            logger.warning("provenance fingerprinting failed: %s", exc)
+            return
+        if usage is not None:
+            _merge_usage(usage, delta)
+        data = _parse_json_loose(text)
+        if isinstance(data, dict):
+            rows = data.get("sources")
+            if not isinstance(rows, list):  # tolerate an alternate top-level key
+                rows = next((v for v in data.values() if isinstance(v, list)), None)
+        elif isinstance(data, list):  # tolerate a bare top-level array
+            rows = data
+        else:
+            rows = None
+        if rows:
+            break
+        logger.warning("provenance pass returned no usable output (attempt %d/%d)",
+                       attempt, PROVENANCE_ATTEMPTS)
     if not rows:
-        logger.warning("provenance pass returned no usable 'sources' array")
         return
     tagged = 0
     for row in rows:
