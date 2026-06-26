@@ -81,7 +81,12 @@ BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 # reads chosen ones through a cheaper sub-LLM summarizer (each provider's cheap
 # tier) so the main context only ever sees short snippets plus the summaries it
 # requested. The summarizer model is per-provider (see Provider.summarizer_model).
-SUMMARIZER_MAX_TOKENS = 1536  # output cap for a file summary
+# Output caps for the flash (reasoning) sub-LLM. On DeepSeek, max_tokens covers
+# reasoning + content together, so these must clear the model's thinking (~300-650+
+# tokens) PLUS the answer — a too-tight cap truncates mid-reasoning and returns
+# empty/partial content (see the provenance-pass fix). Hence the generous headroom.
+SUMMARIZER_MAX_TOKENS = 3072   # output cap for a file summary
+BRIEFING_MAX_TOKENS = 3072     # output cap for the final synthesized briefing
 SUMMARIZER_MAX_DOC_CHARS = 20000  # cap on concatenated file text sent to the summarizer
 
 # Prediction-market / betting platforms excluded from search — their odds are
@@ -1687,7 +1692,7 @@ def summarize_forecast(
             system=None,
             prompt=prompt,
             temperature=0.3,
-            max_output_tokens=2048,
+            max_output_tokens=BRIEFING_MAX_TOKENS,
             thinking_level="low",
         )
     except Exception as exc:  # a briefing failure must not lose the forecast
