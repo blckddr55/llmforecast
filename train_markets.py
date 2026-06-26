@@ -81,7 +81,10 @@ def make_task(event: dict, market: dict) -> dict:
     """A forecasting task: question + context + a market reference for resolving."""
     return {
         "question": market.get("question", ""),
-        "background": f"{event.get('title')} (resolves by {event.get('endDate')}).",
+        # Use the MARKET's own end date, not the event's: a "by <date>?" ladder
+        # bundles staggered sub-markets under one event (whose endDate is just the
+        # earliest rung), so the event date mislabels every later rung.
+        "background": f"{event.get('title')} (resolves by {market.get('endDate') or event.get('endDate')}).",
         "resolution_criteria": market.get("description"),
         "market_price": _yes_price(market),
         "market": {
