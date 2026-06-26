@@ -679,6 +679,30 @@ def _parse_json_object(text: str) -> dict | None:
             return None
 
 
+def _parse_json_loose(text: str):
+    """Parse a JSON value — dict OR list — from a model reply, tolerating fences.
+
+    Unlike _parse_json_object (which requires the strict belief-shaped object), a
+    list-or-object result is fine here: it lets a backend that answers with a bare
+    top-level array still be consumed (see fingerprint_sources). Returns the value
+    or None.
+    """
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        for pattern in (r"\{.*\}", r"\[.*\]"):  # outermost object, then array
+            match = re.search(pattern, text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except (json.JSONDecodeError, ValueError):
+                    continue
+    return None
+
+
 class DeepSeekSession(Session):
     def __init__(self, provider: "DeepSeekProvider", system_instruction: str,
                  temperature: float, max_output_tokens: int):
@@ -1013,6 +1037,40 @@ def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
+def _coerce_evidence_item(item) -> str:
+    """Coerce one evidence-list entry to a string.
+
+    The belief schema declares evidence_for/against as arrays of strings, but a
+    JSON-output backend (DeepSeek) is not schema-enforced and sometimes emits a
+    dict entry (e.g. {"claim": ..., "source_id": "search_1_result_3"}). Flatten a
+    dict to its scalar values — preserving any cited file id so the citation audit
+    still resolves it — so a later "; ".join() can't crash the whole forecast.
+    """
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        parts = [str(v) for v in item.values() if isinstance(v, (str, int, float))]
+        return " ".join(parts) if parts else json.dumps(item, ensure_ascii=False)
+    return str(item)
+
+
+def _normalize_evidence(belief: dict) -> None:
+    """In place: force evidence_for/against to lists of strings.
+
+    Runs once per step right after the belief is parsed, so every downstream
+    consumer (trajectory, citation audit, briefing join, saved JSON) is shielded
+    from a backend that returns dict entries or a bare non-list value.
+    """
+    for key in ("evidence_for", "evidence_against"):
+        items = belief.get(key)
+        if isinstance(items, list):
+            belief[key] = [_coerce_evidence_item(x) for x in items]
+        elif items is None:
+            belief[key] = []
+        else:  # a single non-list value (a lone string, or a dict)
+            belief[key] = [_coerce_evidence_item(items)]
+
+
 # Search-result file ids look like 'search_1_result_3'; these are the only valid
 # citations (everything else the model emits as a source is unverifiable).
 _FILE_ID_RE = re.compile(r"search_\d+_result_\d+")
@@ -1196,9 +1254,16 @@ def fingerprint_sources(
     if usage is not None:
         _merge_usage(usage, delta)
 
-    parsed = _parse_json_object(text) or {}
-    rows = parsed.get("sources")
-    if not isinstance(rows, list):
+    data = _parse_json_loose(text)
+    if isinstance(data, dict):
+        rows = data.get("sources")
+        if not isinstance(rows, list):  # tolerate an alternate top-level key
+            rows = next((v for v in data.values() if isinstance(v, list)), None)
+    elif isinstance(data, list):  # tolerate a bare top-level array
+        rows = data
+    else:
+        rows = None
+    if not rows:
         logger.warning("provenance pass returned no usable 'sources' array")
         return
     tagged = 0
@@ -1374,6 +1439,7 @@ def run_agent(
                 break
 
             belief = step_belief
+            _normalize_evidence(belief)  # evidence lists -> strings before any use
             probability = _clamp(float(belief.get("probability", probability)), 0.05, 0.95)
             belief["probability"] = probability  # store the clamped value
             action = belief.get("action", "submit")
