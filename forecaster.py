@@ -1018,7 +1018,21 @@ def _clamp(value: float, low: float, high: float) -> float:
 _FILE_ID_RE = re.compile(r"search_\d+_result_\d+")
 
 
-def _validate_citations(belief: dict, valid_ids: set[str]) -> dict:
+def _registrable_domain(url: str) -> str:
+    """Best-effort eTLD+1 (no public-suffix dependency): scheme/www./port stripped."""
+    host = urllib.parse.urlparse(url or "").netloc.lower().split(":")[0]
+    host = host.removeprefix("www.")
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _norm_url(url: str) -> str:
+    """Normalize a URL to a dedup key (host without www. + path, no trailing /)."""
+    p = urllib.parse.urlparse(url or "")
+    return (p.netloc.lower().removeprefix("www.") + p.path.rstrip("/")).lower()
+
+
+def _validate_citations(belief: dict, valid_ids: set[str], sources: dict | None = None) -> dict:
     """Flag fabricated source citations against the run's real file-id registry.
 
     The model is told to cite each reference case and evidence item by the file id
@@ -1028,8 +1042,15 @@ def _validate_citations(belief: dict, valid_ids: set[str]) -> dict:
     a fabrication (e.g. DeepSeek inventing 'history_source_1'). We rewrite a bogus
     reference-case source_id to 'unverified' so it can't masquerade as grounded,
     and return counts so ungrounded/fabricated forecasts are visible in telemetry.
-    Mutates `belief` in place; returns the audit.
+
+    Tier 1 of the independence check rides along here (deterministic, no model
+    call): `source_diversity` collapses the cited evidence ids to distinct
+    registrable domains, so the same outlet cited under several ids stops looking
+    like several sources. (Distinct outlets re-reporting one datum are Tier 2's
+    job — see `_audit_source_independence`.) Mutates `belief` in place; returns
+    the audit.
     """
+    sources = sources or {}
     rc = belief.get("reference_cases")
     grounded = prior = fabricated = total = 0
     if isinstance(rc, list):
@@ -1053,12 +1074,14 @@ def _validate_citations(belief: dict, valid_ids: set[str]) -> dict:
 
     ev_cited = ev_valid = 0
     ev_fabricated: list[str] = []
+    cited_valid: set[str] = set()
     for key in ("evidence_for", "evidence_against"):
         for item in belief.get(key) or []:
             for tok in _FILE_ID_RE.findall(str(item)):
                 ev_cited += 1
                 if tok in valid_ids:
                     ev_valid += 1
+                    cited_valid.add(tok)
                 else:
                     ev_fabricated.append(tok)
     if ev_fabricated:
@@ -1066,6 +1089,10 @@ def _validate_citations(belief: dict, valid_ids: set[str]) -> dict:
             "evidence cited %d file id(s) not in the registry: %s",
             len(ev_fabricated), ", ".join(sorted(set(ev_fabricated))),
         )
+
+    # Tier 1: how many *distinct outlets* do the cited ids actually span?
+    domains = {_registrable_domain((sources.get(i) or {}).get("url", "")) for i in cited_valid}
+    domains.discard("")
 
     return {
         "reference_cases": {
@@ -1076,7 +1103,156 @@ def _validate_citations(belief: dict, valid_ids: set[str]) -> dict:
             "cited_ids": ev_cited, "valid": ev_valid,
             "fabricated": len(ev_fabricated),
             "fabricated_ids": sorted(set(ev_fabricated)),
+            "cited_valid_ids": sorted(cited_valid),
+            "source_diversity": {
+                "distinct_ids": len(cited_valid),
+                "distinct_domains": len(domains),
+                # 1.0 = every citation a different outlet; →0 = piled on one outlet
+                "domain_ratio": round(len(domains) / max(1, len(cited_valid)), 2),
+            },
         },
+    }
+
+
+# --- Tier 2 of the independence check: primary-source fingerprinting ---------
+#
+# Citation-id and domain checks share a blind spot: N distinct outlets can all
+# re-report ONE underlying datum (e.g. four news sites citing a single PAC poll),
+# which reads as broad agreement but is a single source laundered into a
+# "consensus". One cheap batched call fingerprints each cited source's *original*
+# datum — assigning a shared `primary_id` to sources that trace to the same one —
+# so the clustering in `_audit_source_independence` can flag the collapse.
+
+PROVENANCE_MAX_TOKENS = 1024
+PROVENANCE_MAX_SRC_CHARS = 2500  # per-source excerpt (the lead usually names the poll)
+PROVENANCE_MIN_CITED = 2         # below this there is no "independence" to assess
+
+PROVENANCE_SYSTEM = (
+    "You are a source-provenance analyst. For each numbered source, identify the "
+    "PRIMARY underlying source of its key quantitative or factual claims — the "
+    "original poll, dataset, study, or official record — NOT the outlet that is "
+    "reporting it. Two sources that report the SAME underlying datum MUST be given "
+    "the SAME primary_id.\n\n"
+    'Return ONLY JSON: {"sources":[{"file_id":..,"primary_kind":..,'
+    '"primary_id":..,"sponsor":..,"partisan":..,"measurement":..}]}\n'
+    "- primary_kind: one of poll | official_data | report | reporting | analysis\n"
+    '- primary_id: a short, stable slug of the ORIGINAL source. For a poll use '
+    '"<pollster>|<field-dates>", e.g. "cygnal|2026-05-07". Reuse the identical '
+    "slug for every source tracing to that same datum.\n"
+    '- sponsor: who commissioned or funded it; "" if independent or none\n'
+    "- partisan: true if that sponsor has a stake in the outcome (a campaign, "
+    "party, or advocacy PAC)\n"
+    "- measurement: raw | modeled_or_push | estimate | unknown — a post-message, "
+    '"informed-ballot", or heavily modelled number is modeled_or_push\n'
+    'Base every field only on the source text; if it is unclear, use "" or '
+    '"unknown". Output one row per file_id given, nothing else.'
+)
+
+
+def fingerprint_sources(
+    cited_ids: set[str],
+    sources: dict,
+    registry: dict[str, Path],
+    usage: dict | None = None,
+) -> None:
+    """Tag each cited evidence source with the PRIMARY datum behind its claims.
+
+    Makes one batched cheap-tier call (the summarizer model) so it can assign a
+    shared `primary_id` across outlets reporting the same source. Writes
+    `sources[id]['provenance']` in place; dedups by URL so each page is read once.
+    Fail-safe: logs and returns on any error rather than killing the run.
+    """
+    by_url: dict[str, list[str]] = {}
+    for fid in sorted(cited_ids):
+        meta = sources.get(fid) or {}
+        by_url.setdefault(_norm_url(meta.get("url", "")) or fid, []).append(fid)
+    reps = {ids[0]: ids for ids in by_url.values()}  # representative id -> siblings
+    if not reps:
+        return
+
+    payload = []
+    for rep in reps:
+        path = registry.get(rep)
+        try:
+            content = path.read_text(encoding="utf-8")[:PROVENANCE_MAX_SRC_CHARS] if path else ""
+        except OSError:
+            content = ""
+        meta = sources.get(rep) or {}
+        payload.append(f"[{rep}] {meta.get('title', '')}\n{meta.get('url', '')}\n{content}")
+
+    provider = get_provider()
+    try:
+        text, delta = provider.complete(
+            model=provider.summarizer_model,
+            system=PROVENANCE_SYSTEM,
+            prompt="Fingerprint these sources:\n\n" + "\n\n---\n\n".join(payload),
+            temperature=0.0,
+            max_output_tokens=PROVENANCE_MAX_TOKENS,
+            thinking_level="low",
+        )
+    except Exception as exc:
+        logger.warning("provenance fingerprinting failed: %s", exc)
+        return
+    if usage is not None:
+        _merge_usage(usage, delta)
+
+    parsed = _parse_json_object(text) or {}
+    rows = parsed.get("sources")
+    if not isinstance(rows, list):
+        logger.warning("provenance pass returned no usable 'sources' array")
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        siblings = reps.get(str(row.get("file_id", "")).strip())
+        if not siblings:
+            continue
+        prov = {
+            "primary_kind": str(row.get("primary_kind", "") or "").strip().lower(),
+            "primary_id": str(row.get("primary_id", "") or "").strip().lower(),
+            "sponsor": str(row.get("sponsor", "") or "").strip(),
+            "partisan": bool(row.get("partisan", False)),
+            "measurement": str(row.get("measurement", "") or "").strip().lower(),
+        }
+        for fid in siblings:
+            sources[fid]["provenance"] = prov
+
+
+def _audit_source_independence(cited_ids: set[str], sources: dict) -> dict:
+    """Cluster the cited evidence by `primary_id`; flag a single datum reported
+    through multiple outlets as 'laundered' — the over-aggregation that the
+    domain check (Tier 1) cannot see. Deterministic; expects fingerprint_sources()
+    to have populated provenance first.
+    """
+    clusters: dict[str, list[str]] = {}
+    sponsors: set[str] = set()
+    push = unknown = 0
+    for fid in cited_ids:
+        prov = (sources.get(fid) or {}).get("provenance")
+        if not prov:
+            unknown += 1
+            continue
+        clusters.setdefault(prov.get("primary_id") or f"_ungrouped:{fid}", []).append(fid)
+        if prov.get("partisan"):
+            sponsors.add(prov.get("sponsor") or "(unnamed)")
+        if prov.get("measurement") == "modeled_or_push":
+            push += 1
+
+    real = {p: ids for p, ids in clusters.items() if not p.startswith("_ungrouped:")}
+    laundered = []
+    for pid, ids in real.items():
+        domains = sorted({_registrable_domain((sources.get(i) or {}).get("url", "")) for i in ids} - {""})
+        if len(domains) > 1:  # one underlying datum, many outlets → false consensus
+            laundered.append({"primary_id": pid, "n_citations": len(ids), "domains": domains})
+
+    return {
+        "fingerprinted": len(cited_ids) - unknown,
+        "unknown": unknown,
+        "distinct_primaries": len(real),
+        "max_cluster": max((len(ids) for ids in real.values()), default=0),
+        "laundered": laundered,
+        "partisan_sponsors": sorted(sponsors),
+        "modeled_or_push": push,
     }
 
 
@@ -1299,7 +1475,16 @@ def run_agent(
 
     # Flag fabricated citations against the real file-id registry (rewrites bogus
     # reference-case source ids to 'unverified' in place; returns the audit).
-    citations = _validate_citations(belief, set(registry))
+    # Tier 1 (domain diversity) rides along inside _validate_citations.
+    citations = _validate_citations(belief, set(registry), sources)
+
+    # Tier 2: fingerprint the cited sources and flag one-datum-many-outlets
+    # laundering. One cheap call, so gate it on enough citations to matter and
+    # allow opt-out for cheap A/B passes (FORECAST_SKIP_PROVENANCE=1).
+    cited_valid = set(citations["evidence"]["cited_valid_ids"])
+    if len(cited_valid) >= PROVENANCE_MIN_CITED and os.environ.get("FORECAST_SKIP_PROVENANCE") != "1":
+        fingerprint_sources(cited_valid, sources, registry, usage)
+        citations["independence"] = _audit_source_independence(cited_valid, sources)
 
     # Attach the decision-process record (#1 trajectory, #2 provenance, #3 stats).
     belief["steps"] = trajectory
@@ -1339,6 +1524,35 @@ class ForecastResult:
         return [float(b["probability"]) for b in self.trials]
 
 
+def _independence_caveats(beliefs: list[dict]) -> list[str]:
+    """Roll the per-trial independence audits up into briefing caveats.
+
+    Turns the Tier-2 signals (one datum cited through many outlets, partisan
+    sponsorship, modelled/push figures) into plain-language warnings so the
+    synthesizer treats laundered evidence as a single data point rather than
+    corroboration — the exact failure the check exists to catch.
+    """
+    laundered: dict[str, int] = {}
+    sponsors: set[str] = set()
+    push = 0
+    for b in beliefs:
+        ind = ((b.get("stats") or {}).get("citations") or {}).get("independence") or {}
+        for cl in ind.get("laundered") or []:
+            laundered[cl["primary_id"]] = max(laundered.get(cl["primary_id"], 0), cl["n_citations"])
+        sponsors.update(ind.get("partisan_sponsors") or [])
+        push += ind.get("modeled_or_push") or 0
+    notes = [
+        f"{n} separate citations trace to ONE underlying source ({pid}) — count it "
+        "as a single data point, not as multiple corroborating sources"
+        for pid, n in laundered.items()
+    ]
+    if sponsors:
+        notes.append("source(s) with a stake in the outcome: " + "; ".join(sorted(sponsors)))
+    if push:
+        notes.append(f"{push} cited figure(s) are modelled/push numbers, not raw measurements")
+    return notes
+
+
 def summarize_forecast(
     question: str,
     beliefs: list[dict],
@@ -1364,12 +1578,22 @@ def summarize_forecast(
         if prior is not None
         else ""
     )
+    caveats = _independence_caveats(beliefs)
+    caveat_block = (
+        "Evidence-quality caveats — factor these into the case for/against and do "
+        "NOT present them as independent corroboration:\n- "
+        + "\n- ".join(caveats)
+        + "\n\n"
+        if caveats
+        else ""
+    )
     prompt = (
         f"Forecasting question: {question}\n\n"
         f"{prior_line}"
         f"{len(beliefs)} independent forecasts were run; their probabilities were "
         f"[{spread}], combined (logit-space mean) into {aggregated:.2f}.\n\n"
         f"Per-trial evidence and reasoning:\n{trials_text}\n\n"
+        f"{caveat_block}"
         "Write a concise briefing for a decision-maker that synthesizes ACROSS the "
         "trials (do not just list them), using exactly these sections:\n"
         f"Forecast: the aggregate probability ({aggregated:.0%}) and the spread.\n"
