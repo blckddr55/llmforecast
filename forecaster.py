@@ -1181,7 +1181,12 @@ def _validate_citations(belief: dict, valid_ids: set[str], sources: dict | None 
 # datum — assigning a shared `primary_id` to sources that trace to the same one —
 # so the clustering in `_audit_source_independence` can flag the collapse.
 
-PROVENANCE_MAX_TOKENS = 1024
+# The summarizer (deepseek-v4-flash) is a REASONING model and DeepSeek counts
+# reasoning + content against max_tokens together; a 1024 cap was fully consumed
+# by reasoning (300-650+ tokens, and it scales with source count), leaving zero
+# for the JSON answer — the call came back empty ("no usable 'sources' array").
+# Give it ample headroom so reasoning can't starve the output.
+PROVENANCE_MAX_TOKENS = 4096
 PROVENANCE_MAX_SRC_CHARS = 2500  # per-source excerpt (the lead usually names the poll)
 PROVENANCE_MIN_CITED = 2         # below this there is no "independence" to assess
 
