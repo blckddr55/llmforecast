@@ -15,6 +15,7 @@ Run with:
 import argparse
 import json
 import logging
+import re
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -22,9 +23,14 @@ from datetime import datetime, timedelta, timezone
 logger = logging.getLogger("polymarket")
 
 GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
+GAMMA_COMMENTS_URL = "https://gamma-api.polymarket.com/comments"
 # Gamma is behind Cloudflare, which 403s the default Python-urllib User-Agent.
 _HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
 _PAGE_LIMIT = 100  # Gamma's max page size
+
+# Polymarket comment threads are heavy with telegram-pump / marketing spam; a
+# profile bio (or body) matching this is dropped wholesale.
+_SPAM_RE = re.compile(r"tele\W?gram|t\.me/|whats\W?app|\bpump\b|join my|\bspam\b", re.I)
 
 
 def _parse_dt(value) -> datetime | None:
@@ -173,6 +179,72 @@ def fetch_markets(
     return events
 
 
+def fetch_event_comments(
+    event_id: str | int,
+    top_n: int = 20,
+    min_len: int = 25,
+    max_scan: int = 200,
+) -> list[dict]:
+    """Fetch an event's top crowd comments (by reaction count), spam-filtered.
+
+    Polymarket comments are EVENT-level, public, and noisy (jokes, abuse,
+    telegram-pump spam). This pulls the highest-reaction comments server-side,
+    drops obvious spam (marketing bios/bodies, reported comments) and trivially
+    short ones, de-duplicates, and returns a compact pool — intended as crowd
+    'leads' to VERIFY downstream, NOT as evidence. Returns up to `top_n` dicts:
+    {body, reactions, created, author}. Best-effort: returns [] on any error.
+    """
+    base = {
+        "parent_entity_type": "Event",
+        "parent_entity_id": event_id,
+        "order": "reactionCount",
+        "ascending": "false",
+        "limit": min(_PAGE_LIMIT, max_scan),
+    }
+    raw: list[dict] = []
+    offset = 0
+    try:
+        while len(raw) < max_scan:
+            url = f"{GAMMA_COMMENTS_URL}?{urllib.parse.urlencode({**base, 'offset': offset})}"
+            request = urllib.request.Request(url, headers=_HEADERS)
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                page = json.load(resp)
+            if not page:
+                break
+            raw.extend(page)
+            if len(page) < base["limit"]:
+                break
+            offset += base["limit"]
+    except Exception as exc:  # network/Cloudflare/JSON — never break a forecast
+        logger.warning("comment fetch failed for event %s: %s", event_id, exc)
+        return []
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for c in raw:
+        body = (c.get("body") or "").strip()
+        key = body.lower()
+        if len(body) < min_len or key in seen:
+            continue
+        if (c.get("reportCount") or 0) > 0:
+            continue
+        bio = (c.get("profile") or {}).get("bio") or ""
+        if _SPAM_RE.search(bio) or _SPAM_RE.search(body):
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "body": body,
+                "reactions": c.get("reactionCount") or 0,
+                "created": c.get("createdAt"),
+                "author": (c.get("profile") or {}).get("name") or "anon",
+            }
+        )
+        if len(out) >= top_n:
+            break
+    return out
+
+
 def _format_event(event: dict, max_markets: int = 6) -> str:
     """Render one event as a compact, readable block for the CLI listing."""
     lines = [
@@ -213,6 +285,15 @@ def main() -> None:
         "(filtered server-side)",
     )
     parser.add_argument(
+        "--comments", action="store_true",
+        help="also fetch each event's top crowd comments (spam-filtered) — opt-in, "
+        "off by default; an extra request per event",
+    )
+    parser.add_argument(
+        "--comments-top", type=int, default=10, metavar="N",
+        help="max comments to fetch per event with --comments (default: 10)",
+    )
+    parser.add_argument(
         "--json", action="store_true",
         help="emit raw JSON instead of the readable listing",
     )
@@ -222,6 +303,9 @@ def main() -> None:
     events = fetch_markets(
         args.min_liquidity, args.days, max_results=args.limit, tag_slug=args.tag
     )
+    if args.comments:  # opt-in: attach top comments to each event
+        for event in events:
+            event["comments"] = fetch_event_comments(event["id"], top_n=args.comments_top)
     if args.json:
         print(json.dumps(events, indent=2))
         return
@@ -230,6 +314,8 @@ def main() -> None:
         return
     for event in events:
         print(_format_event(event))
+        for c in event.get("comments") or []:
+            print(f"    💬 [{c['reactions']}] {c['body'][:150]}")
         print()
 
 
